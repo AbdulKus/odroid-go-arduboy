@@ -8,7 +8,8 @@ namespace go {
 
 constexpr int VisibleRows = 7;
 constexpr int PauseRows = 7;
-constexpr int SettingsRows = 7;
+constexpr int SettingsRows = 8;
+constexpr Rect FpsCorner{0, 0, 26, 18};
 
 using Color = uint16_t;
 constexpr Color rgb(unsigned r, unsigned g, unsigned b) {
@@ -38,6 +39,7 @@ void drawLibrary(Canvas& canvas, const Catalog& catalog, const std::vector<size_
                  size_t selected, size_t top, bool favorites, const Preview* preview, unsigned battery);
 void drawPause(Canvas& canvas, std::string_view title, unsigned selected, unsigned slot, bool hasSave);
 void drawSettings(Canvas& canvas, const Settings& settings, unsigned selected);
+void drawFps(Canvas& canvas, unsigned fps);
 void drawNotice(Canvas& canvas, std::string_view title, std::string_view detail, bool confirm = false);
 void drawStorageError(Canvas& canvas);
 void drawActivity(Canvas& canvas, std::string_view title, std::string_view status);

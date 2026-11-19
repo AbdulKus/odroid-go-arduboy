@@ -24,6 +24,7 @@ extern "C"
 
 #if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #endif
 
 #define COMPRESS_TIME_TRAVEL_STATES 1
@@ -177,6 +178,8 @@ void arduboy_t::reset()
     core_state.cpu.reset();
 #ifdef ARDUGO_EMBEDDED
     core_state.ps_rem = 0;
+    core_state.oled_cycles = 0;
+    core_state.oled_in_reset = true;
 #endif
 
     peripherals.display.reset();
@@ -197,6 +200,11 @@ void arduboy_t::reset()
 
     peripherals.fxport_reg = program_state.cfg.fxport_reg;
     peripherals.fxport_mask = program_state.cfg.fxport_mask;
+#ifdef ARDUGO_EMBEDDED
+    core_state.fx_port = peripherals.fxport_reg;
+    core_state.fx_mask = peripherals.fxport_mask;
+    core_state.fx_selected = core_state.fx_busy = false;
+#endif
 
     if(program_state.flashcart_loaded || program_state.cfg.bootloader)
     {
@@ -1159,6 +1167,71 @@ void arduboy_t::profiler_build_hotspots()
 
 #endif
 
+#ifdef ARDUGO_EMBEDDED
+void arduboy_t::flush_display()
+{
+    if(core_state.oled_cycles != 0)
+    {
+        peripherals.display.advance(core_state.oled_cycles * CYCLE_PS);
+        core_state.oled_cycles = 0;
+    }
+}
+
+#if defined(ESP_PLATFORM)
+IRAM_ATTR
+#endif
+uint32_t arduboy_t::cycle()
+{
+    auto& state = core_state;
+    auto& cpu = state.cpu;
+    const uint8_t display_port = cpu.data[reg::addr::PORTD];
+    const bool fx_selected = (cpu.data[state.fx_port] & state.fx_mask) == 0;
+    const uint32_t elapsed = cpu.advance_cycle();
+
+    auto& fx = peripherals.fx;
+    if(fx_selected != state.fx_selected)
+    {
+        fx.set_enabled(fx_selected);
+        state.fx_selected = fx_selected;
+    }
+    if(cpu.cycle_count >= cpu.spi_done_cycle)
+    {
+        const uint8_t byte = cpu.spi_data_byte;
+        if(!(display_port & reg::bit::PORTD::PORTD6))
+        {
+            // Draw any rows scanned before this SPI byte with the old OLED contents.
+            flush_display();
+            if(display_port & reg::bit::PORTD::PORTD4)
+                peripherals.display.send_data(byte);
+            else
+                peripherals.display.send_command(byte);
+        }
+        cpu.spi_datain_byte = 0;
+        if(fx_selected)
+        {
+            cpu.spi_datain_byte = fx.spi_transceive(byte);
+            state.fx_busy = fx.busy_ps_rem != 0;
+        }
+        cpu.spi_done_cycle = UINT64_MAX;
+    }
+
+    const bool in_reset = !(cpu.data[reg::addr::PORTD] & reg::bit::PORTD::PORTD7);
+    if(!in_reset)
+        state.oled_cycles += elapsed;
+    else if(!state.oled_in_reset)
+    {
+        state.oled_cycles = 0;
+        peripherals.display.reset();
+    }
+    state.oled_in_reset = in_reset;
+    if(state.fx_busy)
+    {
+        fx.advance(elapsed * CYCLE_PS);
+        state.fx_busy = fx.busy_ps_rem != 0;
+    }
+    return elapsed;
+}
+#else
 uint32_t arduboy_t::cycle()
 {
     assert(core_state.cpu.decoded);
@@ -1297,6 +1370,8 @@ uint32_t arduboy_t::cycle()
 
     return cycles;
 }
+
+#endif
 
 static bool compress_lzav(arduboy_t::tt_state_t& state, const char* data, size_t size)
 {
@@ -1659,7 +1734,9 @@ void arduboy_t::advance_instr()
 
 void arduboy_t::advance(uint64_t ps)
 {
+#ifndef ARDENS_NO_DEBUGGER
     update_history();
+#endif
 
     ps += core_state.ps_rem;
     core_state.ps_rem = 0;
@@ -1680,6 +1757,18 @@ void arduboy_t::advance(uint64_t ps)
     core_state.cpu.no_merged = profiler_state.enabled || any_breakpoints;
 #endif
 
+#ifdef ARDUGO_EMBEDDED
+    if(ps >= PS_BUFFER)
+    {
+        const uint64_t budget = (ps - PS_BUFFER) / CYCLE_PS + 1;
+        uint64_t advanced = 0;
+        while(advanced < budget)
+            advanced += cycle();
+        ps -= advanced * CYCLE_PS;
+    }
+    flush_display();
+    peripherals.prev_display_reset = core_state.oled_in_reset;
+#else
     if(!is_present_state())
         core_state.cpu.no_merged = true;
 
@@ -1715,6 +1804,8 @@ void arduboy_t::advance(uint64_t ps)
 #endif
 
     }
+
+#endif
 
     core_state.cpu.update_all();
 

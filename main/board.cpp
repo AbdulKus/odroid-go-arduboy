@@ -65,6 +65,7 @@ void Board::begin() {
     bus.data6_io_num = GPIO_NUM_NC;
     bus.data7_io_num = GPIO_NUM_NC;
     bus.max_transfer_sz = ScreenW * StripRows * sizeof(uint16_t);
+    bus.isr_cpu_id = ESP_INTR_CPU_AFFINITY_0;
     ESP_ERROR_CHECK(spi_bus_initialize(Bus, &bus, SPI_DMA_CH_AUTO));
 
     // Put the card in SPI mode before initializing the LCD on the shared bus.
@@ -160,6 +161,16 @@ void Board::lcdData(const void* data, size_t size) {
 
 void Board::present(const uint16_t* pixels, Rect region) {
     xSemaphoreTake(displayFree_, portMAX_DELAY);
+    queueDisplay(pixels, region);
+}
+
+bool Board::tryPresent(const uint16_t* pixels, Rect region) {
+    if (xSemaphoreTake(displayFree_, 0) != pdTRUE) return false;
+    queueDisplay(pixels, region);
+    return true;
+}
+
+void Board::queueDisplay(const uint16_t* pixels, Rect region) {
     for (int y = 0; y < region.h; ++y) {
         const auto* row = pixels + (region.y + y) * ScreenW + region.x;
         std::copy_n(row, region.w, frame_ + y * region.w);
@@ -324,14 +335,21 @@ void Board::renderAudio() {
     for (;;) {
         dac_event_data_t event{};
         if (xQueueReceive(dacEvents_, &event, portMAX_DELAY) != pdPASS) continue;
-        const auto count = xStreamBufferReceive(samples_, data.data(), data.size(), 0);
+        size_t count = 0;
+        portENTER_CRITICAL(&samplesLock_);
+        if (xStreamBufferBytesAvailable(samples_) >= DacChunk * 3) audioPrimed_ = true;
+        if (audioPrimed_) {
+            count = xStreamBufferReceive(samples_, data.data(), data.size(), 0);
+            if (count < data.size()) audioPrimed_ = false;
+        }
+        portEXIT_CRITICAL(&samplesLock_);
         std::fill(data.begin() + count, data.end(), 128);
         dac_continuous_write_asynchronously(dac_, static_cast<uint8_t*>(event.buf), event.buf_size, data.data(), data.size(), nullptr);
     }
 }
 
 void Board::audio(const int16_t* samples, size_t count, unsigned volume, unsigned speed) {
-    if (!dac_) return;
+    if (!dac_ || count == 0) return;
     if (volume == 0) {
         if (speakerOn_) silence();
         return;
@@ -340,13 +358,30 @@ void Board::audio(const int16_t* samples, size_t count, unsigned volume, unsigne
         gpio_set_level(SpeakerEnable, true);
         speakerOn_ = true;
     }
+    const unsigned nominalRate = AudioHz * speed / 100;
+    const auto now = esp_timer_get_time();
+    if (!audioWindow_) {
+        audioWindow_ = now;
+        audioRate_ = nominalRate;
+    } else {
+        producedSamples_ += count;
+        const auto elapsed = now - audioWindow_;
+        if (elapsed >= 40000) {
+            unsigned rate = producedSamples_ * 1000000ULL / elapsed;
+            // Follow the actual AVR pace if a demanding game falls behind its target.
+            if (rate >= nominalRate * 97 / 100) rate = nominalRate;
+            rate = std::clamp(rate, nominalRate / 8, nominalRate);
+            audioRate_ = (audioRate_ + 3 * rate) / 4;
+            producedSamples_ = 0;
+            audioWindow_ = now;
+        }
+    }
     std::array<uint8_t, 256> out{};
     size_t filled = 0;
-    const unsigned threshold = AudioHz * speed;
     for (size_t i = 0; i < count; ++i) {
-        audioPhase_ += DacHz * 100;
-        while (audioPhase_ >= threshold) {
-            audioPhase_ -= threshold;
+        audioPhase_ += DacHz;
+        while (audioPhase_ >= audioRate_) {
+            audioPhase_ -= audioRate_;
             out[filled++] = std::clamp(128 + samples[i] * int(volume) / 2400, 0, 255);
             if (filled == out.size()) {
                 xStreamBufferSend(samples_, out.data(), filled, 0);
@@ -360,7 +395,15 @@ void Board::audio(const int16_t* samples, size_t count, unsigned volume, unsigne
 void Board::silence() {
     gpio_set_level(SpeakerEnable, false);
     speakerOn_ = false;
-    audioPhase_ = 0;
+    audioRate_ = audioPhase_ = 0;
+    audioWindow_ = 0;
+    producedSamples_ = 0;
+    if (samples_) {
+        portENTER_CRITICAL(&samplesLock_);
+        xStreamBufferReset(samples_);
+        audioPrimed_ = false;
+        portEXIT_CRITICAL(&samplesLock_);
+    }
 }
 
 bool Board::canExit() {

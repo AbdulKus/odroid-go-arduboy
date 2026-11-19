@@ -46,8 +46,20 @@ static uint32_t instr_is_delay(atmega32u4_t const& cpu, size_t n)
     return 0;
 }
 
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+void atmega32u4_t::fill_merged_cache(uint16_t block, size_t slot)
+{
+    memcpy(merged_cache[slot].data(), merged_prog.data() + block * MERGED_CACHE_BLOCK,
+        sizeof(merged_cache[slot]));
+    merged_cache_tags[slot] = block;
+}
+#endif
+
 void atmega32u4_t::merge_instrs()
 {
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    merged_cache_tags.fill(UINT16_MAX);
+#endif
     memcpy(merged_prog.data(), decoded_prog.data(), array_bytes(merged_prog));
 
     for(auto& i : merged_prog)

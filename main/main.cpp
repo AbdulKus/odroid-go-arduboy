@@ -16,6 +16,6 @@ extern "C" void app_main() {
 
     for (;;) {
         app.tick(esp_timer_get_time(), board.input());
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(1);
     }
 }

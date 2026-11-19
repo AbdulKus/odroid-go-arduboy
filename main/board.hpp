@@ -18,6 +18,7 @@ public:
     void begin();
     uint16_t input();
     void present(const uint16_t* pixels, Rect region) override;
+    bool tryPresent(const uint16_t* pixels, Rect region) override;
     void brightness(unsigned percent) override;
     void audio(const int16_t* samples, size_t count, unsigned volume, unsigned speed) override;
     void silence() override;
@@ -32,6 +33,7 @@ private:
     void startAudio();
     void lcdCommand(uint8_t command, const uint8_t* data = nullptr, size_t size = 0);
     void lcdData(const void* data, size_t size);
+    void queueDisplay(const uint16_t* pixels, Rect region);
     void renderDisplay();
     void renderAudio();
     static bool audioReady(dac_continuous_handle_t, const dac_event_data_t*, void*);
@@ -52,7 +54,12 @@ private:
     dac_continuous_handle_t dac_ = nullptr;
     QueueHandle_t dacEvents_ = nullptr;
     StreamBufferHandle_t samples_ = nullptr;
+    portMUX_TYPE samplesLock_ = portMUX_INITIALIZER_UNLOCKED;
+    int64_t audioWindow_ = 0;
+    size_t producedSamples_ = 0;
+    unsigned audioRate_ = 0;
     unsigned audioPhase_ = 0;
+    bool audioPrimed_ = false;
     bool speakerOn_ = false;
     bool mounted_ = false;
 };

@@ -7,7 +7,8 @@ void atmega32u4_t::sound_st_handler_ddrc(atmega32u4_t& cpu, uint16_t ptr, uint8_
 {
     if(ptr == reg::addr::DDRC)
     {
-        // DDRC
+        // Finish the old sample interval before changing the output pins.
+        cpu.update_sound();
         uint32_t e = 0;
         if(x & reg::bit::DDRC::DDC6)
             e |= (1 << 0);

@@ -18,6 +18,7 @@ private:
     static constexpr Rect FullScreen{0, 0, ScreenW, ScreenH};
 
     void draw();
+    void drawGameUpdates(uint64_t nowUs);
     void rebuild(uint64_t keep = 0);
     void mount();
     bool scan(uint64_t keep = 0);
@@ -52,6 +53,9 @@ private:
     uint16_t previousKeys_ = 0, repeatKeys_ = 0;
     uint64_t now_ = 0, lastTick_ = 0, nextRepeat_ = 0, nextPreview_ = 0;
     uint64_t nextBattery_ = 0, nextFrame_ = 0, nextFlush_ = 0;
+    uint64_t fpsSince_ = 0;
+    unsigned submittedFrames_ = 0, measuredFps_ = 0;
+    bool fpsDirty_ = false;
     unsigned battery_ = 101;
 };
 

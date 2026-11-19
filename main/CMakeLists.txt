@@ -2,6 +2,7 @@ include(../src/sources.cmake)
 idf_component_register(
     SRCS board.cpp main.cpp ${ARDUGO_SOURCES}
     INCLUDE_DIRS ${ARDUGO_INCLUDES}
+    LDFRAGMENTS ardens.lf
     PRIV_REQUIRES app_update esp_adc esp_driver_dac esp_driver_gpio
         esp_driver_ledc esp_driver_sdspi esp_driver_spi esp_psram esp_timer fatfs sdmmc
 )

@@ -103,7 +103,12 @@ void App::openGame() {
 }
 
 void App::show(Screen screen) {
-    if (screen == Screen::Playing) nextFrame_ = 0;
+    if (screen == Screen::Playing) {
+        nextFrame_ = fpsSince_ = 0;
+        lastTick_ = now_;
+        submittedFrames_ = measuredFps_ = 0;
+        fpsDirty_ = false;
+    }
     if (screen_ == Screen::Playing && screen != Screen::Playing) platform_.silence();
     screen_ = screen;
     dirty_ = true;
@@ -135,6 +140,7 @@ void App::changeSetting(int delta) {
     }
     case 5: settings_.oledFilter = !settings_.oledFilter; break;
     case 6: settings_.palette = wrap(int(settings_.palette) + delta, 3); break;
+    case 7: settings_.showFps = !settings_.showFps; break;
     }
     dirty_ = true;
 }
@@ -145,7 +151,7 @@ void App::closeSettings() {
     if (old.brightness == settings_.brightness && old.volume == settings_.volume &&
         old.scale == settings_.scale && old.speed == settings_.speed &&
         old.fps == settings_.fps && old.palette == settings_.palette &&
-        old.oledFilter == settings_.oledFilter) return;
+        old.oledFilter == settings_.oledFilter && old.showFps == settings_.showFps) return;
     if (!writeSettings(settingsPath(catalog_), settings_))
         notice("Settings not saved", "Check available space on the SD card.");
 }
@@ -173,7 +179,8 @@ void App::finishConfirm() {
 
 void App::tick(uint64_t nowUs, uint16_t buttons) {
     now_ = nowUs;
-    unsigned elapsed = lastTick_ ? std::min<uint64_t>(nowUs - lastTick_, 40000) : 0;
+    // Discard long stalls (for example an SD write) and deliver sound between short AVR slices.
+    unsigned elapsed = lastTick_ ? std::min<uint64_t>(nowUs - lastTick_, 12000) : 0;
     lastTick_ = nowUs;
     uint16_t pressed = buttons & ~previousKeys_;
     previousKeys_ = buttons;
@@ -265,25 +272,18 @@ void App::tick(uint64_t nowUs, uint16_t buttons) {
             }
             break;
         }
-        if (elapsed) {
-            core_.run(elapsed, settings_.speed, buttons, settings_.oledFilter);
+        while (elapsed) {
+            const unsigned slice = std::min(elapsed, 4000u);
+            core_.run(slice, settings_.speed, buttons, settings_.oledFilter);
             const auto& samples = core_.samples();
             platform_.audio(samples.data(), samples.size(), settings_.volume, settings_.speed);
+            elapsed -= slice;
         }
         if (nowUs >= nextFlush_) {
             core_.flush();
             nextFlush_ = nowUs + 3000000;
         }
-        if (!dirty_ && nowUs >= nextFrame_) {
-            nextFrame_ += 1000000 / settings_.fps;
-            if (nextFrame_ <= nowUs) nextFrame_ = nowUs + 1000000 / settings_.fps;
-            const auto* pixels = core_.pixels();
-            if (std::memcmp(pixels, lastFrame_.data(), lastFrame_.size()) != 0) {
-                canvas_.frame(pixels, settings_.scale, settings_.palette);
-                platform_.present(canvas_.data(), viewport(settings_.scale));
-                std::memcpy(lastFrame_.data(), pixels, lastFrame_.size());
-            }
-        }
+        if (!dirty_) drawGameUpdates(nowUs);
         break;
     case Screen::Paused:
         if (pressed & (Menu | B | Start)) show(Screen::Playing);
@@ -329,6 +329,44 @@ void App::tick(uint64_t nowUs, uint16_t buttons) {
     if (dirty_) draw();
 }
 
+void App::drawGameUpdates(uint64_t nowUs) {
+    if (settings_.showFps) {
+        if (!fpsSince_) fpsSince_ = nowUs;
+        const uint64_t window = nowUs - fpsSince_;
+        if (window >= 1000000) {
+            const unsigned fps = (submittedFrames_ * 1000000ULL + window / 2) / window;
+            if (fps != measuredFps_) {
+                measuredFps_ = fps;
+                fpsDirty_ = true;
+            }
+            submittedFrames_ = 0;
+            fpsSince_ = nowUs;
+        }
+        if (fpsDirty_) {
+            drawFps(canvas_, measuredFps_);
+            if (platform_.tryPresent(canvas_.data(), FpsCorner)) {
+                fpsDirty_ = false;
+                return;
+            }
+        }
+    }
+    if (nowUs < nextFrame_) return;
+    const uint64_t period = 1000000 / settings_.fps;
+    nextFrame_ += period;
+    if (nextFrame_ <= nowUs) nextFrame_ = nowUs + period;
+    const auto* pixels = core_.pixels();
+    if (std::memcmp(pixels, lastFrame_.data(), lastFrame_.size()) != 0) {
+        canvas_.frame(pixels, settings_.scale, settings_.palette);
+        if (platform_.tryPresent(canvas_.data(), viewport(settings_.scale))) {
+            std::memcpy(lastFrame_.data(), pixels, lastFrame_.size());
+            if (settings_.showFps) ++submittedFrames_;
+        } else {
+            // Retry with the newest OLED contents as soon as the LCD transfer is free.
+            nextFrame_ = nowUs;
+        }
+    }
+}
+
 void App::draw() {
     switch (screen_) {
     case Screen::Storage: drawStorageError(canvas_); break;
@@ -339,6 +377,7 @@ void App::draw() {
     case Screen::Playing:
         canvas_.fill(0);
         canvas_.frame(core_.pixels(), settings_.scale, settings_.palette);
+        if (settings_.showFps) drawFps(canvas_, measuredFps_);
         std::memcpy(lastFrame_.data(), core_.pixels(), lastFrame_.size());
         nextFrame_ = now_ + 1000000 / settings_.fps;
         break;

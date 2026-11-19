@@ -172,12 +172,12 @@ bool readSettingsFile(File file, Settings& result) {
         std::memcmp(data.data(), "AGS1", 4) != 0) return false;
     if (data[4] < 10 || data[4] > 100 || data[5] > 100 || data[6] > 2 ||
         (data[7] != 50 && data[7] != 75 && data[7] != 100 && data[7] != 125) ||
-        (data[8] != 20 && data[8] != 30 && data[8] != 60) || data[9] > 2 || data[10] > 1) return false;
+        (data[8] != 20 && data[8] != 30 && data[8] != 60) || data[9] > 2 || data[10] > 3) return false;
     uint8_t checksum = 0;
     for (size_t i = 4; i < 11; ++i) checksum ^= data[i];
     if (checksum != data[11]) return false;
     result = {data[4], data[5], static_cast<Scale>(data[6]), data[7],
-              data[8], data[9], bool(data[10])};
+              data[8], data[9], bool(data[10] & 1), bool(data[10] & 2)};
     return true;
 }
 
@@ -337,7 +337,8 @@ Settings readSettings(const std::string& path) {
 
 bool writeSettings(const std::string& path, const Settings& settings) {
     std::array<uint8_t, 12> data{'A', 'G', 'S', '1', settings.brightness, settings.volume,
-        uint8_t(settings.scale), settings.speed, settings.fps, settings.palette, uint8_t(settings.oledFilter)};
+        uint8_t(settings.scale), settings.speed, settings.fps, settings.palette,
+        uint8_t(settings.oledFilter | (settings.showFps << 1))};
     for (size_t i = 4; i < 11; ++i) data[11] ^= data[i];
     return replaceFile(path, [&](FILE* file) { return writeBytes(file, data.data(), data.size()); });
 }

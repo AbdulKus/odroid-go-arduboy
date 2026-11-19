@@ -531,6 +531,14 @@ std::string arduboy_t::load_savestate(std::istream& f)
         serdes_savestate(bak, *this);
         return "Snapshot: invalid data";
     }
+#ifdef ARDUGO_EMBEDDED
+    core_state.oled_cycles = 0;
+    core_state.oled_in_reset = peripherals.prev_display_reset;
+    core_state.fx_port = peripherals.fxport_reg;
+    core_state.fx_mask = peripherals.fxport_mask;
+    core_state.fx_selected = peripherals.fx.enabled;
+    core_state.fx_busy = peripherals.fx.busy_ps_rem != 0;
+#endif
     return r;
 }
 

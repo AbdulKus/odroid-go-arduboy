@@ -13,6 +13,10 @@
 
 #include <algorithm>
 
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#endif
+
 namespace absim
 {
 
@@ -41,6 +45,8 @@ void atmega32u4_t::st_handle_prr1(
 void atmega32u4_t::st_handle_pin(
     atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
+    if(ptr == reg::addr::PINC)
+        cpu.update_sound();
     cpu.data[ptr + 2] ^= x;
     if(ptr == reg::addr::PINC)
         cpu.data[reg::addr::PINC] = cpu.data[reg::addr::PORTC];
@@ -59,7 +65,10 @@ void atmega32u4_t::st_handle_port(
 {
     cpu.data[ptr] = x;
     if(ptr == reg::addr::PORTC)
+    {
+        cpu.update_sound();
         cpu.data[reg::addr::PINC] = x;
+    }
     if(ptr == reg::addr::PORTD && cpu.twi_adapter)
         cpu.twi_adapter->sync_bus_lines();
 }
@@ -134,6 +143,7 @@ void atmega32u4_t::update_watchdog()
         else if(csr & reg::bit::WDTCSR::WDE)
         {
             // system reset
+            update_sound();
             soft_reset();
             return;
         }
@@ -441,6 +451,9 @@ size_t atmega32u4_t::addr_to_disassembled_index(uint16_t addr)
     return (size_t)index;
 }
 
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+IRAM_ATTR
+#endif
 ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
 {
     uint32_t cycles = 1;
@@ -508,8 +521,8 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
         else
         {
             uint64_t tcycles = cycle_count;
-            int64_t cycles_max = std::min<uint64_t>(
-                max_merged_cycles, MAX_MERGED_CYCLES);
+            int32_t cycles_max = static_cast<int32_t>(std::min<uint64_t>(
+                max_merged_cycles, MAX_MERGED_CYCLES));
 
             // this can happen here because if SREG I-bit is ever changed
             // it'll break out of the loop anyway
@@ -523,7 +536,11 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
                     autobreak(AB_OOB_PC);
                     pc &= last_pc - 1;
                 }
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+                auto const& i = merged_instruction(pc);
+#else
                 auto const& i = merged_prog[pc];
+#endif
                 auto const old_sreg = sreg;
                 auto instr_cycles = INSTR_MAP[i.func](*this, i);
                 bool const i_changed = (old_sreg ^ sreg) & reg::bit::SREG::I;
@@ -532,7 +549,7 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
                 if(!active || i_changed || io_reg_accessed || should_autobreak())
                     break;
                 cycles_max -= instr_cycles;
-            } while((int64_t)cycles_max > 0);
+            } while(cycles_max > 0);
             cycles = uint32_t(cycle_count - tcycles);
         }
     }
@@ -571,7 +588,9 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
     if(~prev_sreg & sreg & reg::bit::SREG::I)
         peripheral_queue.schedule(cycle_count + 1, PQ_INTERRUPT);
 
+#ifndef ARDUGO_EMBEDDED
     update_sound();
+#endif
 
     return cycles;
 }

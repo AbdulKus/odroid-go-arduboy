@@ -27,6 +27,7 @@ struct Settings {
     uint8_t fps = 30;
     uint8_t palette = 0;
     bool oledFilter = false;
+    bool showFps = false;
 };
 
 struct Rect { int x, y, w, h; };
@@ -40,6 +41,10 @@ constexpr Rect viewport(Scale scale) {
 struct Platform {
     virtual ~Platform() = default;
     virtual void present(const uint16_t* pixels, Rect region) = 0;
+    virtual bool tryPresent(const uint16_t* pixels, Rect region) {
+        present(pixels, region);
+        return true;
+    }
     virtual void brightness(unsigned percent) = 0;
     virtual void audio(const int16_t* samples, size_t count, unsigned volume, unsigned speed) = 0;
     virtual void silence() = 0;

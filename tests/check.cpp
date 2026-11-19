@@ -135,6 +135,10 @@ void testUi(const fs::path& sd, const fs::path& capture) {
     tap(go::Select);
     if (!capture.empty()) ppm(capture / "library.ppm", display);
     tap(go::Volume);
+    if (!capture.empty()) {
+        for (int i = 0; i < 15; ++i) tick();
+        ppm(capture / "favorites.ppm", display);
+    }
     tap(go::Volume);
     tap(go::A);
     for (int i = 0; i < 100; ++i) tick();
@@ -162,11 +166,22 @@ void testUi(const fs::path& sd, const fs::path& capture) {
     tap(go::Down);
     tap(go::Down);
     tap(go::Right); // 2x -> Fit
+    for (int i = 0; i < 5; ++i) tap(go::Down);
+    tap(go::Right); // FPS counter
+    if (!capture.empty()) ppm(capture / "settings.ppm", display);
     tap(go::B);
     tap(go::B);
     require(display.audioCalls > audioCalls, "Resume didn't restart emulation");
-    require(go::readSettings((sd / "saves/arduboy/settings.dat").string()).scale == go::Scale::Fit,
-            "Scale settings did not persist");
+    const auto settings = go::readSettings((sd / "saves/arduboy/settings.dat").string());
+    require(settings.scale == go::Scale::Fit && settings.showFps, "Video settings did not persist");
+    for (int i = 0; i < 125; ++i) tick(i < 50 ? go::A : 0);
+    bool yellow = false;
+    for (int y = 0; y < go::FpsCorner.h; ++y) {
+        const auto row = display.frame.data() + y * go::ScreenW;
+        yellow |= std::find(row, row + go::FpsCorner.w, go::rgb(255, 222, 24)) != row + go::FpsCorner.w;
+    }
+    require(yellow, "FPS counter not rendered in the screen corner");
+    if (!capture.empty()) ppm(capture / "fps.ppm", display);
     require(app.flushProgress(), "App progress flush failed");
 }
 

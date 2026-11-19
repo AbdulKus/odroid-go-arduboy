@@ -628,6 +628,23 @@ struct atmega32u4_t
     std::vector<avr_instr_t> decoded_prog = std::vector<avr_instr_t>(PROG_SIZE_BYTES / 2);
     std::vector<avr_instr_t> merged_prog = std::vector<avr_instr_t>(PROG_SIZE_BYTES / 2);
     std::array<disassembled_instr_t, 0> disassembled_prog;
+#ifdef ESP_PLATFORM
+    // Code is decoded into PSRAM. Keep frequently executed instruction blocks
+    // beside the AVR registers in internal memory, without shrinking AVR flash.
+    static constexpr size_t MERGED_CACHE_BLOCK = 16;
+    static constexpr size_t MERGED_CACHE_SLOTS = 64;
+    std::array<std::array<avr_instr_t, MERGED_CACHE_BLOCK>, MERGED_CACHE_SLOTS> merged_cache;
+    std::array<uint16_t, MERGED_CACHE_SLOTS> merged_cache_tags;
+    void fill_merged_cache(uint16_t block, size_t slot);
+    ARDENS_FORCEINLINE const avr_instr_t& merged_instruction(uint16_t address)
+    {
+        const uint16_t block = address / MERGED_CACHE_BLOCK;
+        const size_t slot = block % merged_cache.size();
+        if(merged_cache_tags[slot] != block)
+            fill_merged_cache(block, slot);
+        return merged_cache[slot][address % MERGED_CACHE_BLOCK];
+    }
+#endif
 #else
     std::array<avr_instr_t, PROG_SIZE_BYTES / 2> decoded_prog;
     std::array<avr_instr_t, PROG_SIZE_BYTES / 2> merged_prog; // decoded and merged instrs
@@ -1526,6 +1543,14 @@ struct arduboy_core_state_t
 {
     atmega32u4_t cpu{};
     uint64_t ps_rem{};
+#ifdef ARDUGO_EMBEDDED
+    uint32_t oled_cycles{}; // Deferred rows, flushed before a display write or a save.
+    bool oled_in_reset = true;
+    uint8_t fx_port = reg::addr::PORTD;
+    uint8_t fx_mask = reg::bit::PORTD::PORTD1;
+    bool fx_selected{};
+    bool fx_busy{};
+#endif
 };
 
 struct arduboy_peripherals_t
@@ -1677,6 +1702,9 @@ public:
 
     // advance at least one cycle (returns how many cycles were advanced)
     uint32_t cycle();
+#ifdef ARDUGO_EMBEDDED
+    void flush_display();
+#endif
 
     void advance_instr();
 

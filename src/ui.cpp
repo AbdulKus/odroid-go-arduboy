@@ -66,12 +66,12 @@ void header(Canvas& c, std::string_view title) {
 }
 
 void navRow(Canvas& c, unsigned row, unsigned selected, std::string_view label, std::string_view value = {}) {
-    const int y = 50 + row * 23;
+    const int y = 46 + row * 21;
     if (row == selected) {
         c.rounded({12, y, 296, 21}, Selected);
         c.rect({12, y + 4, 2, 13}, Accent);
     } else {
-        c.rect({22, y + 21, 276, 1}, Surface);
+        c.rect({22, y + 20, 276, 1}, Surface);
     }
     c.text(23, y + 4, label, Text, 174);
     c.text(204, y + 4, value, row == selected ? Accent : Muted, 98);
@@ -163,27 +163,40 @@ void Canvas::frame(const uint8_t* image, Scale scale, unsigned palette) {
 
 void drawLibrary(Canvas& c, const Catalog& catalog, const std::vector<size_t>& games,
                  size_t selected, size_t top, bool favorites, const Preview* preview, unsigned battery) {
-    header(c, "Arduboy Go");
-    if (battery <= 100) {
-        c.rounded({264, 12, 44, 21}, Surface);
-        c.text(270, 16, std::to_string(battery) + "%", battery < 15 ? Gold : Muted, 33);
+    c.fill(Background);
+    const bool favorite = !games.empty() && catalog.games[games[selected]].favorite;
+    constexpr std::string_view controls[] = {"Settings", "Tab", "Favorite", "Rescan"};
+    for (int i = 0; i < 4; ++i) {
+        const int x = i * 80 + 4;
+        const bool active = (i == 1 && favorites) || (i == 2 && favorite);
+        const Color label = i == 2 && games.empty() ? Muted : active ? Accent : Text;
+        c.rounded({x, 3, 72, 21}, active ? Selected : Surface);
+        int width = 0;
+        for (auto code : controls[i]) width += lookup(code, false).advance;
+        c.text(x + (72 - width) / 2, 7, controls[i], label, width);
     }
-    c.rounded({12, 47, 42, 17}, favorites ? Surface : Selected);
-    c.text(22, 49, "All", favorites ? Muted : Accent);
-    c.rounded({59, 47, 65, 17}, favorites ? Selected : Surface);
-    c.text(66, 49, "Favorites", favorites ? Accent : Muted);
+    icon(c, 12, 34, Accent);
+    c.text(41, 32, "Arduboy Go", Text, 218, true);
+    if (battery <= 100) {
+        c.rounded({264, 33, 44, 21}, Surface);
+        c.text(270, 37, std::to_string(battery) + "%", battery < 15 ? Gold : Muted, 33);
+    }
+    c.rect({12, 60, 296, 1}, Line);
+    c.rounded({12, 66, 42, 17}, favorites ? Surface : Selected);
+    c.text(22, 68, "All", favorites ? Muted : Accent);
+    c.rounded({59, 66, 65, 17}, favorites ? Selected : Surface);
+    c.text(66, 68, "Favorites", favorites ? Accent : Muted);
     if (games.empty()) {
-        c.rounded({12, 73, 296, 127}, Surface);
-        c.text(30, 96, favorites ? "No favorites yet" : "Your library is empty", Text, 255, true);
-        c.text(31, 127, favorites ? "Press SELECT on a game to add it." : "Copy .hex or .arduboy files to", Muted);
-        if (!favorites) c.text(31, 145, "roms/arduboy", Accent);
-        footer(c, "START  Refresh    MENU  Settings");
+        c.rounded({12, 89, 296, 139}, Surface);
+        c.text(30, 113, favorites ? "No favorites yet" : "Your library is empty", Text, 255, true);
+        c.text(31, 144, favorites ? "Switch to All and mark a game." : "Copy .hex or .arduboy files to", Muted);
+        if (!favorites) c.text(31, 162, "roms/arduboy", Accent);
         return;
     }
 
     for (size_t i = top; i < games.size() && i < top + VisibleRows; ++i) {
         const auto& game = catalog.games[games[i]];
-        const int y = 67 + int(i - top) * 20;
+        const int y = 87 + int(i - top) * 20;
         if (i == selected) {
             c.rounded({12, y, 148, 19}, Selected);
             c.rect({12, y + 3, 2, 13}, Accent);
@@ -195,25 +208,24 @@ void drawLibrary(Canvas& c, const Catalog& catalog, const std::vector<size_t>& g
         constexpr int track = 138;
         const int thumb = std::max(8, int(track * VisibleRows / games.size()));
         const int scroll = (track - thumb) * top / (games.size() - VisibleRows);
-        c.rect({163, 67, 2, track}, Line);
-        c.rect({163, 67 + scroll, 2, thumb}, Accent);
+        c.rect({163, 87, 2, track}, Line);
+        c.rect({163, 87 + scroll, 2, thumb}, Accent);
     }
 
-    c.rounded({171, 47, 137, 158}, Surface);
-    c.rect({175, 52, 129, 65}, Screen);
-    if (preview) c.preview(175, 52, *preview);
+    c.rounded({171, 66, 137, 160}, Surface);
+    c.rect({175, 71, 129, 65}, Screen);
+    if (preview) c.preview(175, 71, *preview);
     else {
-        icon(c, 229, 64, Line);
-        c.text(209, 91, "No preview", Muted, 88);
+        icon(c, 229, 83, Line);
+        c.text(209, 110, "No preview", Muted, 88);
     }
     const auto& game = catalog.games[games[selected]];
-    c.text(179, 124, game.title, Text, 122);
-    c.text(179, 143, game.packaged ? "ARDUBOY" : "INTEL HEX", Accent, 122);
-    if (game.favorite) c.text(179, 162, "* Favorite", Gold, 122);
+    c.text(179, 143, game.title, Text, 122);
+    c.text(179, 162, game.packaged ? "ARDUBOY" : "INTEL HEX", Accent, 122);
+    if (game.favorite) c.text(179, 181, "* Favorite", Gold, 122);
     std::string count = std::to_string(selected + 1) + " / " + std::to_string(games.size());
     if (catalog.truncated) count += "  (partial)";
-    c.text(179, 183, count, Muted, 122);
-    footer(c, "A Play   SEL Favorite   VOL Filter   MENU Settings");
+    c.text(179, 202, count, Muted, 122);
 }
 
 void drawPause(Canvas& c, std::string_view title, unsigned selected, unsigned slot, bool hasSave) {
@@ -241,7 +253,13 @@ void drawSettings(Canvas& c, const Settings& s, unsigned selected) {
     navRow(c, 4, selected, "Screen updates", std::to_string(s.fps) + " fps");
     navRow(c, 5, selected, "OLED smoothing", s.oledFilter ? "On" : "Off");
     navRow(c, 6, selected, "Game palette", palettes[s.palette]);
+    navRow(c, 7, selected, "Show FPS", s.showFps ? "On" : "Off");
     footer(c, "LEFT / RIGHT  Change    B  Back");
+}
+
+void drawFps(Canvas& c, unsigned fps) {
+    c.rect(FpsCorner, 0);
+    c.text(4, 2, std::to_string(fps), rgb(255, 222, 24), FpsCorner.w - 4);
 }
 
 void drawNotice(Canvas& c, std::string_view title, std::string_view detail, bool confirm) {
