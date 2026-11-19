@@ -1,0 +1,93 @@
+name: Build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SDL2 and AVR tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libsdl2-dev gcc-avr avr-libc
+      - name: Build desktop runner and test
+        run: |
+          cmake -S . -B build-desktop -DARDUGO_DESKTOP=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-desktop --parallel 2
+          ctest --test-dir build-desktop --output-on-failure
+
+  firmware:
+    runs-on: ubuntu-24.04
+    env:
+      IDF_VERSION: v5.4.3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y flex bison gperf ninja-build python3-venv
+      - name: Install ESP-IDF
+        run: |
+          sdk="$RUNNER_TEMP/esp-idf"
+          git clone --depth 1 --branch "$IDF_VERSION" --recursive --shallow-submodules https://github.com/espressif/esp-idf.git "$sdk"
+          "$sdk/install.sh" esp32
+      - name: Build and package
+        shell: bash
+        run: |
+          source "$RUNNER_TEMP/esp-idf/export.sh"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA:0:8}"
+          fi
+          tools/build-firmware.sh "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: odroid-go-firmware
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, firmware]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: odroid-go-firmware
+          path: dist
+      - name: Publish firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            flags=()
+            if [[ "$TAG" == *-* || "$TAG" == v0.* ]]; then flags+=(--prerelease); fi
+            notes=$(cat <<'NOTES'
+          Прошивка для оригинальной Hardkernel ODROID-GO с ESP32.
+
+          - `.fw` — установка из меню загрузчика. Скопируйте файл на microSD в `/odroid/firmware`.
+          - `.img` — самостоятельный образ для установки по USB. Заменяет текущую разметку прошивки.
+          - `SHA256SUMS` — контрольные суммы обоих файлов.
+
+          [Инструкция и управление](https://github.com/AbdulKus/odroid-go-arduboy#установка)
+          NOTES
+            )
+            gh release create "$TAG" dist/* --verify-tag --title "Arduboy Go $TAG" \
+              --generate-notes --notes "$notes" "${flags[@]}"
+          fi

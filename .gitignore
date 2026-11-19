@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/dist/
+/sdkconfig
+/sdkconfig.old
+__pycache__/

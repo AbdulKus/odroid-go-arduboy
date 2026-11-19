@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.16)
+
+option(ARDUGO_DESKTOP "Build the desktop runner and host tests" OFF)
+if(ARDUGO_DESKTOP)
+    project(ardugo LANGUAGES C CXX)
+    enable_testing()
+    add_subdirectory(desktop)
+else()
+    set(IDF_TARGET esp32)
+    set(COMPONENTS main)
+    include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+    project(arduboy-go)
+endif()
