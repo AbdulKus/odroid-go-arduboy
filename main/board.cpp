@@ -552,7 +552,7 @@ void Board::renderAudio() {
                 break;
             }
         }
-        silentRenderSamples_ = hasSignal ? 0 : silentRenderSamples_ + data.size();
+        silentRenderSamples_ = hasSignal ? 0 : std::min<size_t>(4800, silentRenderSamples_ + data.size());
         portENTER_CRITICAL(&samplesLock_);
         const bool enable = audioActive_ && silentRenderSamples_ < 4800 && gen == audioGen_;
         if (speakerPinOn_ != enable) {

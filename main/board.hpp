@@ -85,7 +85,7 @@ private:
     int64_t paceWindowUs_ = 0;
     size_t paceSamples_ = 0;
     DacConverter dac_;
-    size_t silentRenderSamples_ = 0;
+    size_t silentRenderSamples_ = 4800;
     uint32_t audioGen_ = 0;
     uint32_t renderGen_ = 0;
     uint8_t lastAudioSample_ = 128;
