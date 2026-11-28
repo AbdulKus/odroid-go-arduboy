@@ -26,3 +26,8 @@ target_link_libraries(ardugo-check PRIVATE ardugo-core)
 add_dependencies(ardugo-check ardugo-demo)
 add_test(NAME ardugo-check
     COMMAND ${Python3_EXECUTABLE} ${ROOT}/tests/run.py $<TARGET_FILE:ardugo-check> ${DEMO_HEX})
+
+add_executable(ardugo-avr-wait-check ../tests/avr_wait.cpp)
+target_compile_definitions(ardugo-avr-wait-check PRIVATE ${ARDUGO_DEFINES})
+target_link_libraries(ardugo-avr-wait-check PRIVATE ardugo-core)
+add_test(NAME ardugo-avr-wait-check COMMAND ardugo-avr-wait-check)

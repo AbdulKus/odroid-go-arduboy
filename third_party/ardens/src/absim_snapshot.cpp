@@ -217,9 +217,13 @@ public:
     }
 };
 
+template<class T> struct is_deserializer : std::false_type {};
+template<class InputAdapter> struct is_deserializer<bitsery::Deserializer<InputAdapter>> : std::true_type {};
+
 template<class Archive>
 static std::string serdes_savestate(Archive& ar, arduboy_t& a)
 {
+    constexpr bool is_load = is_deserializer<Archive>::value;
     ar(a.core_state.cpu.data);
     ar(a.core_state.cpu.active);
     ar(a.core_state.cpu.wakeup_cycles);
@@ -299,6 +303,7 @@ static std::string serdes_savestate(Archive& ar, arduboy_t& a)
 
     ar(a.core_state.cpu.sound_prev_cycle);
     ar(a.core_state.cpu.sound_cycle);
+    ar(a.core_state.cpu.sound_acc);
     ar(a.core_state.cpu.sound_enabled);
     ar(a.core_state.cpu.sound_pwm);
     ar(a.core_state.cpu.sound_pwm_val);
@@ -326,6 +331,10 @@ static std::string serdes_savestate(Archive& ar, arduboy_t& a)
     ar(a.core_state.cpu.fuse_hi);
     ar(a.core_state.cpu.fuse_ext);
 
+#ifdef ARDUGO_EMBEDDED
+    if(!is_load)
+        a.core_state.oled.sync_to(a.peripherals.display, true);
+#endif
     ar(a.peripherals.display.filtered_pixels);
     ar(a.peripherals.display.filtered_pixel_counts);
     ar(a.peripherals.display.type);
@@ -370,6 +379,13 @@ static std::string serdes_savestate(Archive& ar, arduboy_t& a)
     ar(a.peripherals.display.data_page);
     ar(a.peripherals.display.data_col);
     ar(a.peripherals.display.vsync);
+#ifdef ARDUGO_EMBEDDED
+    if(is_load)
+    {
+        a.core_state.oled.sync_from(a.peripherals.display, true);
+        a.peripherals.display.external_ram = a.core_state.oled.ram.data();
+    }
+#endif
 
     ar(a.peripherals.fx.sectors_modified_data);
     ar(a.peripherals.fx.sectors_modified);
@@ -420,6 +436,14 @@ static std::string serdes_snapshot(Archive& ar, arduboy_t& a)
     ar(a.core_state.cpu.serial_bytes);
     ar(a.core_state.cpu.sound_buffer);
     ar(a.peripherals.fx.sectors);
+    if(is_load)
+    {
+        ++a.peripherals.fx.data_gen;
+#ifdef ARDUGO_EMBEDDED
+        a.core_state.fx_cache_base = UINT32_MAX;
+        a.core_state.fx_cache_gen = 0;
+#endif
+    }
 
     ar(a.profiler_state.hotspots_symbol);
     ar(a.profiler_state.total);
@@ -510,6 +534,10 @@ std::string arduboy_t::load_savestate(std::istream& f)
         return "Snapshot: incompatible version (created with " + version_str(version) + ")";
 
     std::vector<uint8_t> backup;
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    peripherals.fx.read_sectors.fill(nullptr);
+    peripherals.fx.read_sector_indices.fill(w25q128_t::NUM_SECTORS);
+#endif
     {
         bitsery::Serializer<bitsery::OutputBufferAdapter<std::vector<uint8_t>>> bak(backup);
         auto br = serdes_savestate(bak, *this);
@@ -532,7 +560,7 @@ std::string arduboy_t::load_savestate(std::istream& f)
         return "Snapshot: invalid data";
     }
 #ifdef ARDUGO_EMBEDDED
-    core_state.oled_cycles = 0;
+    core_state.oled_next_row = core_state.oled_cycle = core_state.fx_cycle = core_state.cpu.cycle_count;
     core_state.oled_in_reset = peripherals.prev_display_reset;
     core_state.fx_port = peripherals.fxport_reg;
     core_state.fx_mask = peripherals.fxport_mask;

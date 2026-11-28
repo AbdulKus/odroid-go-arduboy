@@ -43,9 +43,6 @@ struct disassembled_instr_t
     disassembled_instr_arg_t arg1;
 };
 void disassemble_instr(avr_instr_t const& i, disassembled_instr_t& d);
-bool instr_is_two_words(avr_instr_t const i);
-bool instr_is_call(avr_instr_t const i);
-bool instr_is_ret(avr_instr_t const i);
 
 enum instr_id_t
 {
@@ -182,13 +179,25 @@ enum instr_id_t
     INSTR_MERGED_CP_CPC,
     INSTR_MERGED_SUBI_SBCI,
     INSTR_MERGED_DELAY,
+    INSTR_MERGED_MICROS_RESULT,
+    INSTR_MERGED_MICROS_TIMER,
+    INSTR_MERGED_MICROS_CALL,
+    INSTR_MERGED_SPI_POLL,
+    INSTR_MERGED_SKIP_RJMP,
+    INSTR_MERGED_ADD_ADC2,
+    INSTR_MERGED_DELAY_CALL,
+    INSTR_MERGED_OLED_SEND,
+    INSTR_MERGED_FX_BLEND,
+    INSTR_MERGED_FX_MASKED_BLEND,
+    INSTR_MERGED_UDIVMOD4,
+    INSTR_MERGED_UDIVMOD2,
 
     NUM_INSTR
 };
 
 uint32_t instr_unknown (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_rcall   (atmega32u4_t& cpu, avr_instr_t const i);
-uint32_t instr_call    (atmega32u4_t& cpu, avr_instr_t const i);
+ARDENS_IRAM uint32_t instr_call    (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_icall   (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_ret     (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_reti    (atmega32u4_t& cpu, avr_instr_t const i);
@@ -211,8 +220,8 @@ uint32_t instr_ldi     (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_lpm     (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_brbs    (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_brbc    (atmega32u4_t& cpu, avr_instr_t const i);
-uint32_t instr_lds     (atmega32u4_t& cpu, avr_instr_t const i);
-uint32_t instr_sts     (atmega32u4_t& cpu, avr_instr_t const i);
+ARDENS_IRAM uint32_t instr_lds     (atmega32u4_t& cpu, avr_instr_t const i);
+ARDENS_IRAM uint32_t instr_sts     (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_ldd_y   (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_ldd_z   (atmega32u4_t& cpu, avr_instr_t const i);
 uint32_t instr_std_y   (atmega32u4_t& cpu, avr_instr_t const i);

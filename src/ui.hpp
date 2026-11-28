@@ -9,12 +9,22 @@ namespace go {
 constexpr int VisibleRows = 7;
 constexpr int PauseRows = 7;
 constexpr int SettingsRows = 8;
+constexpr unsigned PaletteCount = 12;
 constexpr Rect FpsCorner{0, 0, 26, 18};
 
 using Color = uint16_t;
 constexpr Color rgb(unsigned r, unsigned g, unsigned b) {
     return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
+
+struct GamePixels {
+    GamePixels(int width, unsigned palette, bool swapBytes = false);
+    void row(uint16_t* destination, const uint8_t* source) const;
+
+    int width;
+    std::array<Color, 256> colors;
+    std::array<uint8_t, ScreenW> columns;
+};
 
 class Canvas {
 public:

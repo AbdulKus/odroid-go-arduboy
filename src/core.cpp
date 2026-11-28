@@ -1,11 +1,13 @@
 #include "core.hpp"
 #include "absim.hpp"
+#include "absim_jit_xtensa.hpp"
 #include "absim_strstream.hpp"
 #include "catalog.hpp"
 #include "files.hpp"
 #include "miniz.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
@@ -117,6 +119,8 @@ std::string Core::load(const Game& game, const std::string& saveDir) {
     if (!rom.device.empty()) m.program_state.device_type = std::move(rom.device);
     using absim::reg::addr::PORTE;
     auto& cfg = m.program_state.cfg;
+    // Standalone handheld play has no active USB host; enumerating EP0 SETUP on startup overflows tight stacks.
+    cfg.usb_bus_state = absim::USB_BUS_DISCONNECTED;
     if (m.program_state.device_type == "ArduboyFXDevKit") cfg.fxport_mask = 1 << 2;
     if (m.program_state.device_type == "ArduboyMini") {
         cfg.fxport_reg = PORTE;
@@ -131,6 +135,7 @@ std::string Core::load(const Game& game, const std::string& saveDir) {
     m.reload_fx();
     m.reset();
     m.peripherals.display.enable_filter = false;
+    m.peripherals.display.enable_current_limiting = false;
     m.core_state.cpu.sound_buffer.reserve(AudioHz / 6);
     savePath_ = saveDir + "/" + hexId(m.program_state.game_hash);
     restoreProgress();
@@ -146,19 +151,81 @@ void Core::run(unsigned elapsedUs, unsigned speed, uint16_t keys, bool filter) {
     if (!machine_) return;
     auto& m = *machine_;
     setButtons(m, keys);
+    if (filter && !m.peripherals.display.enable_filter)
+        m.peripherals.display.reset_filter_state(true);
     m.peripherals.display.enable_filter = filter;
+    m.peripherals.display.enable_current_limiting = false;
     m.core_state.cpu.sound_buffer.clear();
     m.advance(uint64_t(elapsedUs) * 10000 * speed);
 }
 
 const uint8_t* Core::pixels() const {
-    const auto& display = machine_->peripherals.display;
-    return display.enable_filter ? display.filtered_pixels.data() : display.pixels[0].data();
+    auto& display = machine_->peripherals.display;
+    if (display.enable_filter) {
+        if (display.filter_dirty) display.filter_pixels();
+        return display.filtered_pixels.data();
+    }
+    return display.pixels[0].data();
 }
 
 const std::vector<int16_t>& Core::samples() const { return machine_->core_state.cpu.sound_buffer; }
 uint64_t Core::cycles() const { return machine_->core_state.cpu.cycle_count; }
 const std::string& Core::title() const { return machine_->program_state.title; }
+#ifdef ARDUGO_QUIET_TEST
+void Core::clearBenchmark() {
+    machine_->core_state.cpu.benchmark = {};
+    absim::jit::jit_reset_stats();
+}
+void Core::reportBenchmark() const {
+    const auto& p = machine_->core_state.cpu.benchmark;
+    const auto& j = absim::jit::jit_runtime();
+    std::printf("bench: batches=%lu micros_blocks=%lu micros_timer_blocks=%lu micros_calls=%lu micros_wait_skipped=%lu sampled_queue=%llu sampled_instruction=%llu sampled_devices=%llu\n",
+                static_cast<unsigned long>(p.batches), static_cast<unsigned long>(p.micros_blocks),
+                static_cast<unsigned long>(p.micros_timer_blocks),
+                static_cast<unsigned long>(p.micros_calls),
+                static_cast<unsigned long>(p.micros_wait_iterations),
+                p.queue_cycles, p.instruction_cycles, p.peripheral_cycles);
+    std::printf("jit: failed=%d cap=%lu used=%lu tbl_int=%d compiles=%lu(%llukc) resets=%lu entries=%lu misses=%lu fallbacks=%lu\n",
+                int(j.failed), static_cast<unsigned long>(j.code_cap), static_cast<unsigned long>(j.code_used),
+                int(j.block_in_internal), static_cast<unsigned long>(j.stat_compiles),
+                p.compile_cycles / 1000ULL,
+                static_cast<unsigned long>(j.stat_resets), static_cast<unsigned long>(j.stat_entries),
+                static_cast<unsigned long>(j.stat_misses), static_cast<unsigned long>(j.stat_fallbacks));
+    std::printf("branches: jit=%lu fb=%lu short=%lu wake=%lu sleep=%lu\n",
+                static_cast<unsigned long>(p.branch_jit), static_cast<unsigned long>(p.branch_jit_fb),
+                static_cast<unsigned long>(p.branch_short), static_cast<unsigned long>(p.branch_waking),
+                static_cast<unsigned long>(p.branch_sleep));
+    static const char* const kPqNames[14] = {
+        "DMY", "SPI", "TSYNC", "T1", "T3", "T4", "USB", "WDT", "EEP", "PLL", "ADC", "SPM", "TWI", "IRQ"
+    };
+    std::printf("pq_pops:");
+    for (size_t i = 0; i < 14; ++i)
+        if (p.pq_pops[i]) std::printf(" %s=%lu", kPqNames[i], static_cast<unsigned long>(p.pq_pops[i]));
+    std::printf(" | short_pq:");
+    for (size_t i = 0; i < 14; ++i)
+        if (p.short_pq[i]) std::printf(" %s=%lu", kPqNames[i], static_cast<unsigned long>(p.short_pq[i]));
+    std::printf("\n");
+    static const char* const kHNames[8] = {
+        "outSPDR", "inSPDR", "inSPSR", "outPORT", "inTCNT0", "pendIRQ", "macro", "timed"
+    };
+    bool anyH = false;
+    for (size_t i = 0; i < 8; ++i) if (p.helper_calls[i]) anyH = true;
+    if (anyH) {
+        std::printf("jit_helpers:");
+        for (size_t i = 0; i < 8; ++i)
+            if (p.helper_calls[i])
+                std::printf(" %s=%lu(%llukc)", kHNames[i],
+                            static_cast<unsigned long>(p.helper_calls[i]),
+                            p.helper_cycles[i] / 1000ULL);
+        std::printf("\n");
+        std::printf("timed_funcs:");
+        for (size_t i = 0; i < 160; ++i)
+            if (p.timed_func_hits[i])
+                std::printf(" f%u=%lu", unsigned(i), static_cast<unsigned long>(p.timed_func_hits[i]));
+        std::printf("\n");
+    }
+}
+#endif
 
 bool Core::restoreProgress() {
     auto& m = *machine_;
@@ -216,6 +283,14 @@ std::string Core::save(unsigned slot) {
 
 void Core::syncFlash() {
     auto& m = *machine_;
+    auto& cpu = m.core_state.cpu;
+    if(cpu.usb.bus_state != absim::USB_BUS_DISCONNECTED) {
+        // Older slots include an emulated USB host. Drop its pending
+        // endpoint requests before continuing standalone play.
+        cpu.usb.bus_state = absim::USB_BUS_DISCONNECTED;
+        cpu.reset_usb();
+        cpu.update_usb();
+    }
     auto& fx = m.peripherals.fx;
     auto modified = fx.sectors_modified;
     auto minPage = fx.min_page;
@@ -226,6 +301,7 @@ void Core::syncFlash() {
     fx.max_page = maxPage;
     fx.sectors_modified = modified;
     m.program_state.game_hash = hash;
+    m.peripherals.display.reset_filter_state(false);
     // Slots restore the running game without rewriting its persistent progress.
     m.core_state.cpu.eeprom_dirty = false;
     fx.sectors_dirty = false;

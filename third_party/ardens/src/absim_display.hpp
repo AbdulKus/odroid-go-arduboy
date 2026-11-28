@@ -1,6 +1,7 @@
 #include "absim.hpp"
 
 #include <cmath>
+#include <cstring>
 
 #if defined(ARDENS_SSE2)
 #include <emmintrin.h>
@@ -269,54 +270,7 @@ void display_t::send_command(uint8_t byte)
 
 void display_t::send_data(uint8_t byte)
 {
-    if(type != SH1106 || uint8_t(data_col - 2) < 128)
-    {
-        uint8_t col = data_col;
-        if(type == SH1106)
-            col -= 2;
-        uint8_t mapped_col = segment_remap ? 127 - col : col;
-        size_t i = data_page * 128 + mapped_col;
-        ram[i & 1023] = byte;
-    }
-
-    switch(addressing_mode)
-    {
-    case addr_mode::HORIZONTAL:
-        if(data_col >= col_end)
-        {
-            data_col = col_start;
-            if(data_page >= page_end)
-                data_page = page_start;
-            else
-                data_page = (data_page + 1) & 0x7;
-        }
-        else
-            data_col = (data_col + 1) & 0x7f;
-        break;
-
-    case addr_mode::VERTICAL:
-        if(data_page >= page_end)
-        {
-            data_page = page_start;
-            if(data_col >= col_end)
-                data_col = col_start;
-            else
-                data_col = (data_col + 1) & 0x7f;
-        }
-        else
-            data_page = (data_page + 1) & 0x7;
-        break;
-        
-    case addr_mode::PAGE:
-        if(data_col >= col_end)
-            data_col = col_start;
-        else
-            data_col = (data_col + 1) & 0x7f;
-        break;
-
-    default:
-        break;
-    }
+    display_send_data_common(*this, byte);
 }
 
 ARDENS_FORCEINLINE void display_t::update_pixels_row()
@@ -337,15 +291,19 @@ ARDENS_FORCEINLINE void display_t::update_pixels_row()
     size_t pindex = (63 - out_row) * 128 + 128;
 
     if(!enable_filter)
-        pixel_history_index = 0;
-
-    auto& parray = pixels[pixel_history_index];
-
-    if((mux_ratio >= 16 && row == mux_ratio) || row >= 63)
     {
-        if(enable_filter && ++pixel_history_index >= MAX_PIXEL_HISTORY)
-            pixel_history_index = 0;
-        vsync = true;
+#if defined(ARDENS_SSE2)
+        auto& parray = pixels[1];
+        if((mux_ratio >= 16 && row == mux_ratio) || row >= 63)
+        {
+            pixels[0] = pixels[1];
+            vsync = true;
+        }
+#else
+        auto& parray = pixels[0];
+        if((mux_ratio >= 16 && row == mux_ratio) || row >= 63)
+            vsync = true;
+#endif
     }
 
     constexpr float F = 0.65f;
@@ -356,13 +314,15 @@ ARDENS_FORCEINLINE void display_t::update_pixels_row()
     uint8_t p0 = 0;
     uint8_t p1 = enable_charge_pump ? tcontrast : tcontrast >> 4;
 
+    uint8_t const* const disp_ram = ram_ptr();
+
     // current limiting
     if(enable_current_limiting)
     {
         // count number of pixels on in the current row
         int num_pixels_on = 0;
         for(int i = 0; i < 128; ++i)
-            if(ram[rindex + i] & mask)
+            if(disp_ram[rindex + i] & mask)
                 ++num_pixels_on;
         if(inverse_display)
             num_pixels_on = 128 - num_pixels_on;
@@ -401,9 +361,51 @@ ARDENS_FORCEINLINE void display_t::update_pixels_row()
 
     if(inverse_display) std::swap(p0, p1);
 
+    if(enable_filter)
+    {
+        const uint8_t y = 63 - out_row;
+        const uint8_t s = filter_slot;
+        const uint8_t prev = uint8_t((s + 4u) % 5u);
+        FilterRow& fr = filter_rows[y];
+        uint8_t const* src = disp_ram + rindex;
+        auto pack32 = [src, mask](int base) -> uint32_t {
+            uint32_t w = 0;
+            for(int k = 0; k < 32; ++k)
+                if(src[base - k] & mask)
+                    w |= (1u << k);
+            return w;
+        };
+        const uint32_t b0 = pack32(127);
+        const uint32_t b1 = pack32(95);
+        const uint32_t b2 = pack32(63);
+        const uint32_t b3 = pack32(31);
+        const bool same_prev =
+            fr.p0[prev] == p0 && fr.p1[prev] == p1 &&
+            fr.bits[prev][0] == b0 && fr.bits[prev][1] == b1 &&
+            fr.bits[prev][2] == b2 && fr.bits[prev][3] == b3;
+        fr.p0[s] = p0;
+        fr.p1[s] = p1;
+        fr.bits[s][0] = b0;
+        fr.bits[s][1] = b1;
+        fr.bits[s][2] = b2;
+        fr.bits[s][3] = b3;
+        if(!same_prev)
+            filtered_steady_mask &= ~(1ULL << y);
+
+        if((mux_ratio >= 16 && row == mux_ratio) || row >= 63)
+        {
+            if(++filter_slot >= 5u)
+                filter_slot = 0;
+            filter_dirty = true;
+            vsync = true;
+        }
+        return;
+    }
+
 #if defined(ARDENS_SSE2)
     {
-        uint8_t* src = ram.data() + rindex;
+        auto& parray = pixels[1];
+        uint8_t const* src = disp_ram + rindex;
         uint8_t* dst = parray.data() + pindex;
         __m128i vp0 = _mm_set1_epi8((char)p0);
         __m128i vp1 = _mm_set1_epi8((char)p1);
@@ -428,74 +430,154 @@ ARDENS_FORCEINLINE void display_t::update_pixels_row()
             src += 16;
         }
     }
+    if(vsync)
+        pixels[0] = pixels[1];
 #else
+    auto& parray = pixels[0];
+    if((mux_ratio >= 16 && row == mux_ratio) || row >= 63)
+        vsync = true;
+    alignas(4) uint8_t rowbuf[128];
+    uint8_t const* src = disp_ram + rindex;
     for(int i = 0; i < 128; ++i)
-    {
-        uint8_t p = p0;
-        if(ram[rindex++] & mask)
-            p = p1;
-        // decrement because the Arduboy's display is upside-down
-        parray[--pindex] = p;
-    }
+        rowbuf[127 - i] = (src[i] & mask) ? p1 : p0;
+    pindex -= 128;
+    std::memcpy(&parray[pindex], rowbuf, 128);
 #endif
-    if(vsync && enable_filter)
-        filter_pixels();
 }
 
-void display_t::filter_pixels()
+ARDENS_IRAM void display_t::reset_filter_state(bool seed_from_pixels0)
 {
-    memset(&filtered_pixel_counts, 0, sizeof(filtered_pixel_counts));
-    static constexpr uint8_t C[MAX_PIXEL_HISTORY] = { 42, 84, 84, 42 };
-    for(int n = 0; n < MAX_PIXEL_HISTORY; ++n)
+    filtered_steady_mask = 0;
+    filter_slot = 0;
+    pixel_history_index = 0;
+    filter_dirty = seed_from_pixels0;
+    if(!seed_from_pixels0)
     {
-        auto c = C[(MAX_PIXEL_HISTORY - 1 - n + pixel_history_index) % MAX_PIXEL_HISTORY];
-        uint8_t const* src = &pixels[n][0];
-        uint16_t* dst = &filtered_pixel_counts[0];
-        uint16_t* dst_end = dst + 8192;
-#if defined(ARDENS_SSE2)
-        __m128i vc = _mm_set1_epi16((int16_t)c);
-        __m128i vz = _mm_setzero_si128();
-        while(dst < dst_end)
-        {
-            __m128i vd0 = _mm_loadu_si128((__m128i const*)dst + 0);
-            __m128i vd1 = _mm_loadu_si128((__m128i const*)dst + 1);
-            __m128i vs = _mm_loadu_si128((__m128i const*)src);
-            __m128i vr0 = _mm_add_epi16(vd0, _mm_mullo_epi16(_mm_unpacklo_epi8(vs, vz), vc));
-            __m128i vr1 = _mm_add_epi16(vd1, _mm_mullo_epi16(_mm_unpackhi_epi8(vs, vz), vc));
-            _mm_storeu_si128((__m128i*)dst + 0, vr0);
-            _mm_storeu_si128((__m128i*)dst + 1, vr1);
-            src += 16;
-            dst += 16;
-        }
-#else
-        while(dst < dst_end)
-            *dst++ += *src++ * c;
-#endif
+        memset(&filter_rows, 0, sizeof(filter_rows));
+        return;
     }
-#if defined(ARDENS_SSE2)
+    for(int y = 0; y < 64; ++y)
     {
-        uint16_t const* src = &filtered_pixel_counts[0];
-        uint8_t* dst = &filtered_pixels[0];
-        uint8_t* dst_end = dst + 8192;
-        while(dst < dst_end)
+        const uint8_t* src = &pixels[0][y * 128];
+        uint8_t lo = 255;
+        uint8_t hi = 0;
+        for(int x = 0; x < 128; ++x)
         {
-            // vs0: 0.1.2.3.4.5.6.7.
-            // vs0: 8.9.A.B.C.D.E.F.
-            __m128i vs0 = _mm_loadu_si128((__m128i const*)src + 0);
-            __m128i vs1 = _mm_loadu_si128((__m128i const*)src + 1);
-            __m128i vt0 = _mm_srli_epi16(vs0, 8);
-            __m128i vt1 = _mm_srli_epi16(vs1, 8);
-            __m128i vd = _mm_packus_epi16(vt0, vt1);
-            _mm_storeu_si128((__m128i*)dst, vd);
-            src += 16;
-            dst += 16;
+            lo = std::min(lo, src[x]);
+            hi = std::max(hi, src[x]);
+        }
+        std::array<uint32_t, 4> words{};
+        for(int w = 0; w < 4; ++w)
+        {
+            uint32_t bits = 0;
+            for(int k = 0; k < 32; ++k)
+                if(src[w * 32 + k] > lo)
+                    bits |= (1u << k);
+            words[w] = bits;
+        }
+        FilterRow& fr = filter_rows[y];
+        for(int s = 0; s < 5; ++s)
+        {
+            fr.p0[s] = lo;
+            fr.p1[s] = hi;
+            fr.bits[s] = words;
         }
     }
-#else
-    for(int i = 0; i < 8192; ++i)
-        filtered_pixels[i] = uint8_t(filtered_pixel_counts[i] / 256);
-#endif
+    std::memcpy(filtered_pixels.data(), pixels[0].data(), filtered_pixels.size());
+    filtered_steady_mask = ~0ULL;
+    filter_dirty = false;
 }
+
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("Os")
+#endif
+ARDENS_IRAM ARDENS_NOINLINE void display_t::filter_pixels()
+{
+    filter_dirty = false;
+    const uint8_t cur = filter_slot % 5u;
+    const uint8_t s0 = uint8_t((cur + 1u) % 5u);
+    const uint8_t s1 = uint8_t((cur + 2u) % 5u);
+    const uint8_t s2 = uint8_t((cur + 3u) % 5u);
+    const uint8_t s3 = uint8_t((cur + 4u) % 5u);
+
+    static constexpr uint32_t EXPAND4[16] = {
+        0x00000000u, 0x00000001u, 0x00000100u, 0x00000101u,
+        0x00010000u, 0x00010001u, 0x00010100u, 0x00010101u,
+        0x01000000u, 0x01000001u, 0x01000100u, 0x01000101u,
+        0x01010000u, 0x01010001u, 0x01010100u, 0x01010101u,
+    };
+
+    uint8_t lvl[16]{};
+    uint32_t cached_p0_key = 0xffffffffu, cached_p1_key = 0xffffffffu;
+    bool have_lvl = false;
+    alignas(4) uint32_t row_out[32];
+
+    for(int y = 0; y < 64; ++y)
+    {
+        if((filtered_steady_mask >> y) & 1ULL)
+            continue;
+
+        const FilterRow& fr = filter_rows[y];
+        const uint32_t p0_key =
+            uint32_t(fr.p0[s0]) | (uint32_t(fr.p0[s1]) << 8) |
+            (uint32_t(fr.p0[s2]) << 16) | (uint32_t(fr.p0[s3]) << 24);
+        const uint32_t p1_key =
+            uint32_t(fr.p1[s0]) | (uint32_t(fr.p1[s1]) << 8) |
+            (uint32_t(fr.p1[s2]) << 16) | (uint32_t(fr.p1[s3]) << 24);
+        if(!have_lvl || cached_p0_key != p0_key || cached_p1_key != p1_key)
+        {
+            cached_p0_key = p0_key;
+            cached_p1_key = p1_key;
+            const uint32_t p0_0 = fr.p0[s0], p0_1 = fr.p0[s1], p0_2 = fr.p0[s2], p0_3 = fr.p0[s3];
+            const uint32_t p1_0 = fr.p1[s0], p1_1 = fr.p1[s1], p1_2 = fr.p1[s2], p1_3 = fr.p1[s3];
+            for(uint32_t idx = 0; idx < 16; ++idx)
+            {
+                const uint32_t v0 = (idx & 1u) ? p1_0 : p0_0;
+                const uint32_t v1 = (idx & 2u) ? p1_1 : p0_1;
+                const uint32_t v2 = (idx & 4u) ? p1_2 : p0_2;
+                const uint32_t v3 = (idx & 8u) ? p1_3 : p0_3;
+                lvl[idx] = uint8_t((42u * (v0 + v3 + 2u * (v1 + v2))) >> 8);
+            }
+            have_lvl = true;
+        }
+
+        const auto& b0 = fr.bits[s0];
+        const auto& b1 = fr.bits[s1];
+        const auto& b2 = fr.bits[s2];
+        const auto& b3 = fr.bits[s3];
+
+        uint32_t diff =
+            (p0_key ^ ((p0_key << 8) | (p0_key >> 24))) |
+            (p1_key ^ ((p1_key << 8) | (p1_key >> 24)));
+        for(int wi = 0; wi < 4; ++wi)
+        {
+            const uint32_t w0 = b0[wi], w1 = b1[wi], w2 = b2[wi], w3 = b3[wi];
+            diff |= (w0 ^ w1) | (w1 ^ w2) | (w2 ^ w3);
+            uint32_t* dstw = row_out + wi * 8;
+            for(int nib = 0; nib < 8; ++nib)
+            {
+                const int sh = nib * 4;
+                const uint32_t code =
+                    EXPAND4[(w0 >> sh) & 0xfu] |
+                    (EXPAND4[(w1 >> sh) & 0xfu] << 1) |
+                    (EXPAND4[(w2 >> sh) & 0xfu] << 2) |
+                    (EXPAND4[(w3 >> sh) & 0xfu] << 3);
+                dstw[nib] =
+                    uint32_t(lvl[code & 0xffu]) |
+                    (uint32_t(lvl[(code >> 8) & 0xffu]) << 8) |
+                    (uint32_t(lvl[(code >> 16) & 0xffu]) << 16) |
+                    (uint32_t(lvl[code >> 24]) << 24);
+            }
+        }
+        if(diff == 0)
+            filtered_steady_mask |= (1ULL << y);
+        std::memcpy(&filtered_pixels[y * 128], row_out, 128);
+    }
+}
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 ARDENS_FORCEINLINE bool display_t::advance(uint64_t ps)
 {
@@ -509,8 +591,30 @@ ARDENS_FORCEINLINE bool display_t::advance(uint64_t ps)
         return false;
     }
 
-    uint32_t rc = row_cycle + uint32_t(ps / ps_per_clk);
-    ps_rem = ps % ps_per_clk;
+    uint32_t ticks = 0;
+    const uint64_t fast_limit = ps_per_clk << 2;
+    if(ps < fast_limit)
+    {
+        while(ps >= ps_per_clk)
+        {
+            ps -= ps_per_clk;
+            ++ticks;
+        }
+        ps_rem = ps;
+    }
+    else if(ps <= 0xffffffffULL && ps_per_clk <= 0xffffffffULL)
+    {
+        const uint32_t ps32 = uint32_t(ps);
+        const uint32_t clk32 = uint32_t(ps_per_clk);
+        ticks = ps32 / clk32;
+        ps_rem = ps32 % clk32;
+    }
+    else
+    {
+        ticks = uint32_t(ps / ps_per_clk);
+        ps_rem = ps % ps_per_clk;
+    }
+    uint32_t rc = row_cycle + ticks;
     while(rc >= cycles_per_row)
     {
         update_pixels_row();
@@ -543,6 +647,7 @@ void display_t::reset()
     memset(&ram, 0, sizeof(ram));
     memset(&pixels, 0, sizeof(pixels));
     memset(&filtered_pixels, 0, sizeof(filtered_pixels));
+    reset_filter_state(false);
 
     ref_segment_current = 0.195f;
     current_limit_slope = 0.75f;

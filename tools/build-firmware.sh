@@ -10,5 +10,5 @@ if ! git -C "$IDF_PATH" apply --reverse --check "$patch_file" 2>/dev/null; then
     fi
 fi
 version="${1:-dev}"
-idf.py -D "PROJECT_VER=$version" build
+idf.py -D "PROJECT_VER=$version" -D ARDUGO_QUIET_TEST=OFF build
 python3 tools/package.py --version "$version"

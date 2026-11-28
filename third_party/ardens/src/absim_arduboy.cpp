@@ -34,11 +34,22 @@ namespace absim
 {
 
 #if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+void* w25q128_t::operator new(size_t size)
+{
+    void* memory = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if(!memory) throw std::bad_alloc();
+    return memory;
+}
+
+void w25q128_t::operator delete(void* ptr)
+{
+    heap_caps_free(ptr);
+}
+
 arduboy_t::core_storage_t arduboy_t::allocate_core_state()
 {
-    // Keep the AVR register file, timers, and SPI state in internal RAM when possible.
-    void* memory = heap_caps_malloc_prefer(sizeof(arduboy_core_state_t), 2,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // The ESP32 opcode handlers are compiled for stores to internal RAM.
+    void* memory = heap_caps_malloc(sizeof(arduboy_core_state_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if(!memory) throw std::bad_alloc();
     try
     {
@@ -57,7 +68,14 @@ void arduboy_t::delete_core_state_t::operator()(arduboy_core_state_t* state) con
     heap_caps_free(state);
 }
 
-arduboy_t::arduboy_t() : core_storage(allocate_core_state()), core_state(*core_storage) {}
+arduboy_t::arduboy_t() : core_storage(allocate_core_state()), core_state(*core_storage)
+{
+    core_state.cpu.spi_bus = this;
+    core_state.cpu.core_state = &core_state;
+    core_state.fx_ptr = &peripherals.fx;
+    peripherals.display.external_ram = core_state.oled.ram.data();
+    core_state.oled.sync_from(peripherals.display, true);
+}
 #else
 arduboy_t::arduboy_t() {}
 #endif
@@ -175,15 +193,28 @@ void arduboy_t::reset()
     if(program_state.flashcart_loaded || program_state.cfg.bootloader)
         core_state.cpu.fuse_hi &= ~(1 << 0);
     core_state.cpu.usb.bus_state = program_state.cfg.usb_bus_state;
+#ifdef ARDUGO_EMBEDDED
+    core_state.cpu.spi_bus = this;
+    core_state.cpu.core_state = &core_state;
+    core_state.fx_ptr = &peripherals.fx;
+    core_state.fx_port = program_state.cfg.fxport_reg;
+    core_state.fx_mask = program_state.cfg.fxport_mask;
+#endif
     core_state.cpu.reset();
 #ifdef ARDUGO_EMBEDDED
     core_state.ps_rem = 0;
-    core_state.oled_cycles = 0;
+    core_state.oled_next_row = core_state.oled_cycle = core_state.fx_cycle = core_state.cpu.cycle_count;
     core_state.oled_in_reset = true;
+    core_state.fx_cache_base = UINT32_MAX;
+    core_state.fx_cache_gen = 0;
 #endif
 
     peripherals.display.reset();
     peripherals.display.type = program_state.cfg.display_type;
+#ifdef ARDUGO_EMBEDDED
+    peripherals.display.external_ram = core_state.oled.ram.data();
+    core_state.oled.sync_from(peripherals.display, true);
+#endif
     peripherals.fx.reset();
     debugger_state.paused = false;
     debugger_state.break_step = 0xffffffff;
@@ -201,9 +232,8 @@ void arduboy_t::reset()
     peripherals.fxport_reg = program_state.cfg.fxport_reg;
     peripherals.fxport_mask = program_state.cfg.fxport_mask;
 #ifdef ARDUGO_EMBEDDED
-    core_state.fx_port = peripherals.fxport_reg;
-    core_state.fx_mask = peripherals.fxport_mask;
     core_state.fx_selected = core_state.fx_busy = false;
+    sync_spi_pins(core_state.cpu.cycle_count);
 #endif
 
     if(program_state.flashcart_loaded || program_state.cfg.bootloader)
@@ -1170,11 +1200,98 @@ void arduboy_t::profiler_build_hotspots()
 #ifdef ARDUGO_EMBEDDED
 void arduboy_t::flush_display()
 {
-    if(core_state.oled_cycles != 0)
+    advance_display_to(core_state.cpu.cycle_count);
+    schedule_display_row();
+}
+
+void arduboy_t::advance_display_to(uint64_t at)
+{
+    auto& state = core_state;
+    if(!state.oled_in_reset && at > state.oled_cycle)
+        peripherals.display.advance((at - state.oled_cycle) * CYCLE_PS);
+    state.oled_cycle = at;
+}
+
+ARDENS_NOINLINE
+static uint64_t div_cycle_ps_slow(uint64_t until)
+{
+    return (until + arduboy_t::CYCLE_PS - 1) / arduboy_t::CYCLE_PS;
+}
+
+ARDENS_IRAM
+void arduboy_t::schedule_display_row()
+{
+    const auto& display = peripherals.display;
+    const uint64_t row_ps = std::max(0, display.cycles_per_row - display.row_cycle) * display.ps_per_clk;
+    const uint64_t until = row_ps > display.ps_rem ? row_ps - display.ps_rem : 0;
+    constexpr uint32_t cps = static_cast<uint32_t>(CYCLE_PS);
+    const uint64_t wait_cycles = (until <= UINT32_MAX - cps)
+        ? ((static_cast<uint32_t>(until) + cps - 1u) / cps)
+        : div_cycle_ps_slow(until);
+    core_state.oled_next_row = core_state.oled_cycle + wait_cycles;
+}
+
+void arduboy_t::sync_spi_pins(uint64_t at)
+{
+    auto& state = core_state;
+    const bool selected = (state.cpu.data[state.fx_port] & state.fx_mask) == 0;
+    if(selected != state.fx_selected)
     {
-        peripherals.display.advance(core_state.oled_cycles * CYCLE_PS);
-        core_state.oled_cycles = 0;
+        auto& fx = peripherals.fx;
+        if(state.fx_busy)
+        {
+            fx.advance((at - state.fx_cycle) * CYCLE_PS);
+            state.fx_busy = fx.busy_ps_rem != 0;
+            state.fx_cycle = at;
+        }
+        fx.set_enabled(selected);
+        state.fx_selected = selected;
     }
+
+    const bool in_reset = !(state.cpu.data[reg::addr::PORTD] & reg::bit::PORTD::PORTD7);
+    if(in_reset != state.oled_in_reset)
+    {
+        if(in_reset)
+        {
+            peripherals.display.reset();
+            state.oled.sync_from(peripherals.display, true);
+        }
+        state.oled_cycle = at;
+        state.oled_in_reset = in_reset;
+        schedule_display_row();
+    }
+}
+
+uint8_t arduboy_t::exchange_spi_byte(uint8_t byte, uint64_t at)
+{
+    auto& state = core_state;
+    const uint8_t port = state.cpu.data[reg::addr::PORTD];
+    if(!(port & reg::bit::PORTD::PORTD6))
+    {
+        auto& display = peripherals.display;
+        const bool is_data = (port & reg::bit::PORTD::PORTD4) != 0;
+        const bool flush = !is_data || (!state.oled_in_reset && at >= state.oled_next_row);
+        // Data writes affect only display RAM. Sub-row oscillator updates can
+        // wait until a scan reads a row, or a command changes panel timing.
+        if(flush) advance_display_to(at);
+        if(is_data) display_send_data_common(state.oled, byte);
+        else
+        {
+            state.oled.sync_cursors_to(display);
+            display.send_command(byte);
+            state.oled.sync_from(display, false);
+        }
+        if(flush) schedule_display_row();
+    }
+
+    if(!state.fx_selected) return 0;
+    auto& fx = peripherals.fx;
+    if(state.fx_busy)
+        fx.advance((at - state.fx_cycle) * CYCLE_PS);
+    const uint8_t received = fx.spi_transceive(byte);
+    state.fx_busy = fx.busy_ps_rem != 0;
+    if(state.fx_busy) state.fx_cycle = at;
+    return received;
 }
 
 #if defined(ESP_PLATFORM)
@@ -1182,54 +1299,11 @@ IRAM_ATTR
 #endif
 uint32_t arduboy_t::cycle()
 {
-    auto& state = core_state;
-    auto& cpu = state.cpu;
-    const uint8_t display_port = cpu.data[reg::addr::PORTD];
-    const bool fx_selected = (cpu.data[state.fx_port] & state.fx_mask) == 0;
-    const uint32_t elapsed = cpu.advance_cycle();
-
-    auto& fx = peripherals.fx;
-    if(fx_selected != state.fx_selected)
-    {
-        fx.set_enabled(fx_selected);
-        state.fx_selected = fx_selected;
-    }
-    if(cpu.cycle_count >= cpu.spi_done_cycle)
-    {
-        const uint8_t byte = cpu.spi_data_byte;
-        if(!(display_port & reg::bit::PORTD::PORTD6))
-        {
-            // Draw any rows scanned before this SPI byte with the old OLED contents.
-            flush_display();
-            if(display_port & reg::bit::PORTD::PORTD4)
-                peripherals.display.send_data(byte);
-            else
-                peripherals.display.send_command(byte);
-        }
-        cpu.spi_datain_byte = 0;
-        if(fx_selected)
-        {
-            cpu.spi_datain_byte = fx.spi_transceive(byte);
-            state.fx_busy = fx.busy_ps_rem != 0;
-        }
-        cpu.spi_done_cycle = UINT64_MAX;
-    }
-
-    const bool in_reset = !(cpu.data[reg::addr::PORTD] & reg::bit::PORTD::PORTD7);
-    if(!in_reset)
-        state.oled_cycles += elapsed;
-    else if(!state.oled_in_reset)
-    {
-        state.oled_cycles = 0;
-        peripherals.display.reset();
-    }
-    state.oled_in_reset = in_reset;
-    if(state.fx_busy)
-    {
-        fx.advance(elapsed * CYCLE_PS);
-        state.fx_busy = fx.busy_ps_rem != 0;
-    }
-    return elapsed;
+    auto& cpu = core_state.cpu;
+#ifdef ARDUGO_QUIET_TEST
+    cpu.benchmark.measuring = (++cpu.benchmark.batches & 63u) == 0;
+#endif
+    return cpu.advance_cycle();
 }
 #else
 uint32_t arduboy_t::cycle()
@@ -1766,6 +1840,7 @@ void arduboy_t::advance(uint64_t ps)
             advanced += cycle();
         ps -= advanced * CYCLE_PS;
     }
+    core_state.cpu.update_spi();
     flush_display();
     peripherals.prev_display_reset = core_state.oled_in_reset;
 #else
@@ -1820,6 +1895,13 @@ void arduboy_t::advance(uint64_t ps)
             peripherals.display.filtered_pixels.data(),
             peripherals.display.pixels[0].data(),
             array_bytes(peripherals.display.filtered_pixels));
+#endif
+    }
+    else
+    {
+#ifndef ESP_PLATFORM
+        if(peripherals.display.filter_dirty)
+            peripherals.display.filter_pixels();
 #endif
     }
 

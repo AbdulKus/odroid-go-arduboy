@@ -1,5 +1,12 @@
 #pragma once
 
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+#include "esp_attr.h"
+#define ARDENS_IRAM IRAM_ATTR
+#else
+#define ARDENS_IRAM
+#endif
+
 #if defined(_MSC_VER)
 
 #define ARDENS_FORCEINLINE __forceinline

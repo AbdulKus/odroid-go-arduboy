@@ -49,7 +49,7 @@ void atmega32u4_t::adc_schedule()
     }
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::update_adc()
+ARDENS_NOINLINE void atmega32u4_t::update_adc()
 {
     if(!adc_busy)
         return;

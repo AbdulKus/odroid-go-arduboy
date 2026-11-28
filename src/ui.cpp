@@ -77,6 +77,26 @@ void navRow(Canvas& c, unsigned row, unsigned selected, std::string_view label, 
     c.text(204, y + 4, value, row == selected ? Accent : Muted, 98);
 }
 
+struct PaletteSpec {
+    const char* name;
+    uint8_t stops[4][3];
+};
+
+constexpr PaletteSpec Palettes[PaletteCount] = {
+    {"White",       {{  0,   0,   0}, { 82,  84,  86}, {165, 168, 171}, {245, 250, 252}}},
+    {"Mint",        {{  0,   0,   0}, { 28, 118, 128}, { 72, 202, 165}, {135, 252, 195}}},
+    {"Amber",       {{  0,   0,   0}, {120,  42,   8}, {215, 120,  30}, {255, 212, 115}}},
+    {"GB DMG",      {{155, 188,  15}, {139, 172,  15}, { 48,  98,  48}, { 15,  56,  15}}},
+    {"GB Pocket",   {{196, 207, 161}, {139, 149, 109}, { 77,  83,  60}, { 31,  31,  31}}},
+    {"GB Light",    {{  0, 210, 184}, {  0, 160, 145}, {  8,  96,  92}, {  8,  36,  44}}},
+    {"GBC Classic", {{248, 240, 216}, {240, 168,  64}, {120, 168,  64}, { 24,  32,  48}}},
+    {"GBC Pastel",  {{248, 236, 228}, {240, 144, 168}, {112, 188, 200}, { 36,  32,  76}}},
+    {"GBC Dark",    {{  0,   0,   0}, { 56, 112, 232}, {120, 224, 144}, {252, 244, 210}}},
+    {"GBC Ember",   {{  0,   0,   0}, {176,  36,  48}, {248, 144,  32}, {255, 244, 176}}},
+    {"Virtual Boy", {{  0,   0,   0}, {104,   0,   0}, {200,  16,   8}, {255,  56,  28}}},
+    {"Ice Blue",    {{  0,   0,   0}, { 36,  96, 176}, { 96, 184, 244}, {216, 244, 255}}},
+};
+
 }
 
 Canvas::Canvas() : pixels_(ScreenW * ScreenH) {}
@@ -137,28 +157,45 @@ void Canvas::preview(int x, int y, const Preview& image) {
         std::copy_n(image.data() + row * PreviewW, PreviewW, pixels_.data() + (y + row) * ScreenW + x);
 }
 
+GamePixels::GamePixels(int width, unsigned palette, bool swapBytes) : width(width) {
+    const auto& stops = Palettes[palette % PaletteCount].stops;
+    for (unsigned i = 0; i < colors.size(); ++i) {
+        const unsigned seg = std::min<unsigned>(i * 3u / 255u, 2u);
+        const unsigned lo = seg * 85u;
+        const unsigned t = i - lo;
+        const auto chan = [&](int c) {
+            const int a = stops[seg][c];
+            const int b = stops[seg + 1][c];
+            return unsigned(a + (b - a) * int(t) / 85);
+        };
+        const auto color = rgb(chan(0), chan(1), chan(2));
+        colors[i] = swapBytes ? __builtin_bswap16(color) : color;
+    }
+    for (int x = 0; x < width; ++x) columns[x] = x * GameW / width;
+}
+
+void GamePixels::row(uint16_t* destination, const uint8_t* source) const {
+    for (int x = 0; x < width; ++x) destination[x] = colors[source[columns[x]]];
+}
+
 void Canvas::frame(const uint8_t* image, Scale scale, unsigned palette) {
     const auto view = viewport(scale);
-    constexpr unsigned colors[][3] = {{245, 250, 252}, {125, 244, 184}, {255, 201, 110}};
-    std::array<Color, 256> lut{};
-    for (unsigned i = 0; i < lut.size(); ++i) {
-        const auto& ink = colors[palette];
-        lut[i] = rgb(i * ink[0] / 255, i * ink[1] / 255, i * ink[2] / 255);
-    }
-    std::array<uint8_t, ScreenW> columns{};
-    for (int x = 0; x < view.w; ++x) columns[x] = x * GameW / view.w;
-
+    const GamePixels pixels(view.w, palette);
     int lastRow = -1;
     for (int y = 0; y < view.h; ++y) {
         auto* row = pixels_.data() + (view.y + y) * ScreenW + view.x;
         const int sourceY = y * GameH / view.h;
         if (sourceY == lastRow) std::copy_n(row - ScreenW, view.w, row);
         else {
-            const auto* src = image + sourceY * GameW;
-            for (int x = 0; x < view.w; ++x) row[x] = lut[src[columns[x]]];
+            pixels.row(row, image + sourceY * GameW);
             lastRow = sourceY;
         }
     }
+}
+
+bool Platform::tryPresentGame(Canvas& canvas, const uint8_t* image, Scale scale, unsigned palette) {
+    canvas.frame(image, scale, palette);
+    return tryPresent(canvas.data(), viewport(scale));
 }
 
 void drawLibrary(Canvas& c, const Catalog& catalog, const std::vector<size_t>& games,
@@ -245,14 +282,13 @@ void drawPause(Canvas& c, std::string_view title, unsigned selected, unsigned sl
 void drawSettings(Canvas& c, const Settings& s, unsigned selected) {
     header(c, "Settings");
     constexpr const char* scales[] = {"1:1  /  128x64", "2x  /  256x128", "Fit  /  320x160"};
-    constexpr const char* palettes[] = {"White", "Mint", "Amber"};
     navRow(c, 0, selected, "Brightness", std::to_string(s.brightness) + "%");
     navRow(c, 1, selected, "Volume", s.volume ? std::to_string(s.volume) + "%" : "Muted");
     navRow(c, 2, selected, "Game scale", scales[static_cast<unsigned>(s.scale)]);
     navRow(c, 3, selected, "Emulation speed", std::to_string(s.speed) + "%");
     navRow(c, 4, selected, "Screen updates", std::to_string(s.fps) + " fps");
     navRow(c, 5, selected, "OLED smoothing", s.oledFilter ? "On" : "Off");
-    navRow(c, 6, selected, "Game palette", palettes[s.palette]);
+    navRow(c, 6, selected, "Game palette", Palettes[s.palette % PaletteCount].name);
     navRow(c, 7, selected, "Show FPS", s.showFps ? "On" : "Off");
     footer(c, "LEFT / RIGHT  Change    B  Back");
 }

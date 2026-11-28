@@ -360,6 +360,16 @@ void atmega32u4_t::decode()
         decode_instr(decoded_prog[i], w0, w1);
     }
 
+#ifdef ARDUGO_EMBEDDED
+    for(size_t i = 0; i < decoded_prog.size(); ++i)
+    {
+        auto& op = decoded_prog[i];
+        if(op.func == INSTR_SBRC || op.func == INSTR_SBRS || op.func == INSTR_CPSE ||
+           op.func == INSTR_SBIS || op.func == INSTR_SBIC)
+            op.m2 = 2 + (i + 1 < decoded_prog.size() && instr_is_two_words(decoded_prog[i + 1]));
+    }
+#endif
+
 #ifndef ARDUGO_EMBEDDED
     // disassemble
     num_instrs = 0;
@@ -382,6 +392,13 @@ void atmega32u4_t::decode()
 #endif
 
     merge_instrs();
+
+#ifdef ARDUGO_EMBEDDED
+    ++jit_decode_gen;
+    jit_prog_ptr = prog.data();
+    jit_spm_active = spm_en_cycles != 0;
+    jit_invalidate();
+#endif
 
     decoded = true;
 }

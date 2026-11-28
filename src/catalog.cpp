@@ -1,5 +1,6 @@
 #include "catalog.hpp"
 #include "files.hpp"
+#include "ui.hpp"
 #include "miniz.h"
 #include "lodepng.h"
 #include "yyjson/yyjson.h"
@@ -168,16 +169,20 @@ bool readFavoriteFile(File file, std::vector<uint64_t>& favorites) {
 
 bool readSettingsFile(File file, Settings& result) {
     std::array<uint8_t, 12> data{};
-    if (!file || !readBytes(file.get(), data.data(), data.size()) ||
-        std::memcmp(data.data(), "AGS1", 4) != 0) return false;
+    const bool okHeader = file && readBytes(file.get(), data.data(), data.size()) &&
+        (std::memcmp(data.data(), "AGS1", 4) == 0 || std::memcmp(data.data(), "AGS2", 4) == 0);
+    if (!okHeader) return false;
+    const bool validFps = data[8] == 20 || data[8] == 30 || data[8] == 40 || data[8] == 45 || data[8] == 60;
     if (data[4] < 10 || data[4] > 100 || data[5] > 100 || data[6] > 2 ||
         (data[7] != 50 && data[7] != 75 && data[7] != 100 && data[7] != 125) ||
-        (data[8] != 20 && data[8] != 30 && data[8] != 60) || data[9] > 2 || data[10] > 3) return false;
+        !validFps || data[9] >= PaletteCount || data[10] > 3) return false;
     uint8_t checksum = 0;
     for (size_t i = 4; i < 11; ++i) checksum ^= data[i];
     if (checksum != data[11]) return false;
+    // Migrate legacy AGS1 settings (saved when oledFilter defaulted to false) to enable OLED smoothing.
+    const bool oledFilter = (data[3] == '1') ? true : bool(data[10] & 1);
     result = {data[4], data[5], static_cast<Scale>(data[6]), data[7],
-              data[8], data[9], bool(data[10] & 1), bool(data[10] & 2)};
+              data[8], data[9], oledFilter, bool(data[10] & 2)};
     return true;
 }
 
@@ -336,7 +341,7 @@ Settings readSettings(const std::string& path) {
 }
 
 bool writeSettings(const std::string& path, const Settings& settings) {
-    std::array<uint8_t, 12> data{'A', 'G', 'S', '1', settings.brightness, settings.volume,
+    std::array<uint8_t, 12> data{'A', 'G', 'S', '2', settings.brightness, settings.volume,
         uint8_t(settings.scale), settings.speed, settings.fps, settings.palette,
         uint8_t(settings.oledFilter | (settings.showFps << 1))};
     for (size_t i = 4; i < 11; ++i) data[11] ^= data[i];

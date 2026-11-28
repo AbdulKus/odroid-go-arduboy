@@ -5,12 +5,6 @@ namespace absim
 
 static constexpr uint32_t SYNC_PRESCALER_PERIOD = 1024;
 
-void atmega32u4_t::st_handler_timsk(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
-{
-    cpu.data[ptr] = x;
-    cpu.schedule_interrupt_check();
-}
-
 ARDENS_FORCEINLINE static uint32_t word(atmega32u4_t const& cpu, uint32_t addr)
 {
     uint32_t lo = cpu.data[addr + 0];
@@ -67,6 +61,10 @@ ARDENS_FORCEINLINE static uint64_t ticks_from_sync_cycles(
         return 0;
     if(divider == 1)
         return cycles;
+#if defined(ARDUGO_EMBEDDED) && (defined(__GNUC__) || defined(__clang__))
+    if((divider & (divider - 1)) == 0)
+        return ((prescaler_phase & (divider - 1)) + cycles) >> __builtin_ctz(divider);
+#endif
     return ((prescaler_phase % divider) + cycles) / divider;
 }
 
@@ -529,6 +527,18 @@ static void timer16_advance_ticks(
     uint32_t top = timer.top;
     uint32_t com3a = timer.com3a;
 
+#ifdef ARDUGO_EMBEDDED
+    if(!tifr && tcnt <= top &&
+       (timer.base_addr != reg::addr::TCCR3A || com3a == 0) &&
+       ocrNa == timer.ocrNa_buffer && ocrNb == timer.ocrNb_buffer && ocrNc == timer.ocrNc_buffer &&
+       (!timer.phase_correct || top >= 1))
+    {
+        const uint64_t period = timer.phase_correct ? (2ULL * top) : (uint64_t(top) + 1ULL);
+        if(ticks >= 2 * period)
+            ticks = period + (ticks % period);
+    }
+#endif
+
     while(ticks > 0)
     {
         bool reached_phase_bottom = false;
@@ -628,7 +638,12 @@ static void timer16_advance_ticks(
     timer.tcnt = tcnt & 0xffff;
     timer.count_down = count_down;
     set_word(cpu, timer.base_addr + 0x4, timer.tcnt);
-    set_timer_flags(cpu, timer.tifrN_addr, tifr);
+    if(tifr)
+    {
+        cpu.data[timer.tifrN_addr] |= tifr;
+        if((cpu.data[timer.tifrN_addr] & cpu.data[timer.timskN_addr]) != 0)
+            cpu.schedule_interrupt_check();
+    }
 }
 
 static uint64_t timer16_next_ticks(
@@ -649,15 +664,36 @@ static uint64_t timer16_next_ticks(
     }
     else
     {
-        if(timer.phase_correct)
-            update_tcycles = min_nonzero(update_tcycles, timer.top, timer.top - timer.tcnt);
+        if(!timer.delayed_tifr_flags &&
+           !timer.update_ocrN_at_top && !timer.update_ocrN_at_bottom &&
+           (timer.base_addr != reg::addr::TCCR3A || timer.com3a == 0) &&
+           (timer.base_addr != reg::addr::TCCR1A || (cpu.data[reg::addr::TCCR1A] & 0xfc) == 0))
+        {
+            const uint8_t timsk = cpu.data[timer.timskN_addr];
+            if((timsk & reg::bit::TIMSK1::TOIE1) ||
+               (timer.top_source_icr && (timsk & reg::bit::TIMSK1::ICIE1)))
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tov - timer.tcnt + 1);
+            if(timsk & reg::bit::TIMSK1::OCIE1A)
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNa - timer.tcnt);
+            if(timsk & reg::bit::TIMSK1::OCIE1B)
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNb - timer.tcnt);
+            if(timsk & reg::bit::TIMSK1::OCIE1C)
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNc - timer.tcnt);
+            if(timer.tcnt == timer.top && timer.top != 0)
+                update_tcycles = 1;
+        }
         else
-            update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tov - timer.tcnt + 1);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNa - timer.tcnt);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNb - timer.tcnt);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNc - timer.tcnt);
-        if(timer.tcnt == timer.top && timer.top != 0)
-            update_tcycles = 1;
+        {
+            if(timer.phase_correct)
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.top - timer.tcnt);
+            else
+                update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tov - timer.tcnt + 1);
+            update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNa - timer.tcnt);
+            update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNb - timer.tcnt);
+            update_tcycles = min_nonzero(update_tcycles, timer.top, timer.ocrNc - timer.tcnt);
+            if(timer.tcnt == timer.top && timer.top != 0)
+                update_tcycles = 1;
+        }
     }
     if(update_tcycles == UINT32_MAX)
     {
@@ -667,6 +703,48 @@ static uint64_t timer16_next_ticks(
     }
     return std::max<uint32_t>(1, update_tcycles);
 }
+
+#ifdef ARDUGO_EMBEDDED
+static bool timer16_is_idle(
+    const atmega32u4_t& cpu, const atmega32u4_t::timer16_t& timer)
+{
+    const bool is_t3 = (timer.base_addr == reg::addr::TCCR3A);
+    if((cpu.data[timer.timskN_addr] & 0x2f) != 0)
+        return false;
+    if(is_t3 ? (timer.com3a != 0) : ((cpu.data[timer.base_addr] & 0xfc) != 0))
+        return false;
+    if(timer.delayed_tifr_flags || timer.compare_block_next_tick)
+        return false;
+    return timer.ocrNa == timer.ocrNa_buffer &&
+           timer.ocrNb == timer.ocrNb_buffer &&
+           timer.ocrNc == timer.ocrNc_buffer;
+}
+
+static void timer16_flush_idle(
+    atmega32u4_t& cpu, atmega32u4_t::timer16_t& timer, bool keep_deferred)
+{
+    if(!timer.idle_deferred)
+        return;
+    if(timer16_running(cpu, timer))
+    {
+        const uint64_t dc = cpu.timer_sync.prev_update_cycle - timer.idle_start_cycle;
+        timer.idle_deferred = false;
+        timer16_advance_ticks(
+            cpu, timer,
+            ticks_from_sync_cycles(timer.idle_phase, dc, timer.divider));
+    }
+    if(keep_deferred && timer16_is_idle(cpu, timer) && timer16_running(cpu, timer))
+    {
+        timer.idle_start_cycle = cpu.timer_sync.prev_update_cycle;
+        timer.idle_phase = cpu.timer_sync.prescaler_cycle;
+        timer.idle_deferred = true;
+    }
+    else
+    {
+        timer.idle_deferred = false;
+    }
+}
+#endif
 
 static void sync_refresh_configs(atmega32u4_t& cpu, bool force_active)
 {
@@ -689,7 +767,11 @@ static void sync_reschedule(atmega32u4_t& cpu)
         next = std::min(next, cpu.timer0.next_update_cycle);
     }
 
-    uint64_t ticks1 = timer16_next_ticks(cpu, cpu.timer1);
+    uint64_t ticks1 =
+#ifdef ARDUGO_EMBEDDED
+        timer16_is_idle(cpu, cpu.timer1) ? UINT64_MAX :
+#endif
+        timer16_next_ticks(cpu, cpu.timer1);
     cpu.timer1.next_update_cycle = UINT64_MAX;
     if(ticks1 != UINT64_MAX)
     {
@@ -698,7 +780,11 @@ static void sync_reschedule(atmega32u4_t& cpu)
         next = std::min(next, cpu.timer1.next_update_cycle);
     }
 
-    uint64_t ticks3 = timer16_next_ticks(cpu, cpu.timer3);
+    uint64_t ticks3 =
+#ifdef ARDUGO_EMBEDDED
+        timer16_is_idle(cpu, cpu.timer3) ? UINT64_MAX :
+#endif
+        timer16_next_ticks(cpu, cpu.timer3);
     cpu.timer3.next_update_cycle = UINT64_MAX;
     if(ticks3 != UINT64_MAX)
     {
@@ -729,6 +815,46 @@ static void sync_advance_to(atmega32u4_t& cpu, uint64_t target_cycle)
         if(timer0_running(cpu))
             timer0_advance_ticks(
                 cpu, ticks_from_sync_cycles(phase, cycles, cpu.timer0.divider));
+#ifdef ARDUGO_EMBEDDED
+        if(timer16_running(cpu, cpu.timer1))
+        {
+            if(timer16_is_idle(cpu, cpu.timer1))
+            {
+                if(!cpu.timer1.idle_deferred)
+                {
+                    cpu.timer1.idle_deferred = true;
+                    cpu.timer1.idle_start_cycle = cpu.timer_sync.prev_update_cycle;
+                    cpu.timer1.idle_phase = phase;
+                }
+            }
+            else
+            {
+                timer16_flush_idle(cpu, cpu.timer1, false);
+                timer16_advance_ticks(
+                    cpu, cpu.timer1,
+                    ticks_from_sync_cycles(phase, cycles, cpu.timer1.divider));
+            }
+        }
+        if(timer16_running(cpu, cpu.timer3))
+        {
+            if(timer16_is_idle(cpu, cpu.timer3))
+            {
+                if(!cpu.timer3.idle_deferred)
+                {
+                    cpu.timer3.idle_deferred = true;
+                    cpu.timer3.idle_start_cycle = cpu.timer_sync.prev_update_cycle;
+                    cpu.timer3.idle_phase = phase;
+                }
+            }
+            else
+            {
+                timer16_flush_idle(cpu, cpu.timer3, false);
+                timer16_advance_ticks(
+                    cpu, cpu.timer3,
+                    ticks_from_sync_cycles(phase, cycles, cpu.timer3.divider));
+            }
+        }
+#else
         if(timer16_running(cpu, cpu.timer1))
             timer16_advance_ticks(
                 cpu, cpu.timer1,
@@ -737,6 +863,7 @@ static void sync_advance_to(atmega32u4_t& cpu, uint64_t target_cycle)
             timer16_advance_ticks(
                 cpu, cpu.timer3,
                 ticks_from_sync_cycles(phase, cycles, cpu.timer3.divider));
+#endif
 
         cpu.timer_sync.prescaler_cycle =
             uint32_t((phase + cycles) % SYNC_PRESCALER_PERIOD);
@@ -749,6 +876,7 @@ static void sync_advance_to(atmega32u4_t& cpu, uint64_t target_cycle)
     cpu.timer_sync.prev_update_cycle = target_cycle;
 }
 
+ARDENS_IRAM
 void atmega32u4_t::update_sync_timers()
 {
     sync_advance_to(*this, cycle_count);
@@ -756,17 +884,20 @@ void atmega32u4_t::update_sync_timers()
     sync_reschedule(*this);
 }
 
+ARDENS_IRAM
 void atmega32u4_t::update_timer0()
 {
     update_sync_timers();
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::update_timer1()
+ARDENS_NOINLINE
+void atmega32u4_t::update_timer1()
 {
     update_sync_timers();
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::update_timer3()
+ARDENS_NOINLINE
+void atmega32u4_t::update_timer3()
 {
     update_sync_timers();
 }
@@ -774,6 +905,44 @@ ARDENS_FORCEINLINE void atmega32u4_t::update_timer3()
 ARDENS_FORCEINLINE static void sync_write_barrier(atmega32u4_t& cpu)
 {
     sync_advance_to(cpu, cpu.cycle_count + 1);
+}
+
+ARDENS_IRAM
+#ifdef ARDUGO_EMBEDDED
+static bool timer4_can_defer(const atmega32u4_t& cpu);
+static void timer4_advance_to(atmega32u4_t& cpu, uint64_t target_cycle);
+static void timer4_reschedule(atmega32u4_t& cpu);
+#endif
+
+void atmega32u4_t::flush_idle_sync_timers()
+{
+#ifdef ARDUGO_EMBEDDED
+    sync_advance_to(*this, cycle_count);
+    timer16_flush_idle(*this, timer1, false);
+    timer16_flush_idle(*this, timer3, false);
+#endif
+}
+
+void atmega32u4_t::st_handler_timsk(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
+{
+#ifdef ARDUGO_EMBEDDED
+    const bool is_t1 = (ptr == reg::addr::TIMSK1);
+    const bool is_t3 = (ptr == reg::addr::TIMSK3);
+    const bool sync_change = (is_t1 || is_t3);
+    const bool is_t4 = ptr == reg::addr::TIMSK4 && cpu.timer4.divider != 0;
+    if(sync_change)
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, is_t1 ? cpu.timer1 : cpu.timer3, false);
+    }
+    if(is_t4) timer4_advance_to(cpu, cpu.cycle_count);
+#endif
+    cpu.data[ptr] = x;
+#ifdef ARDUGO_EMBEDDED
+    if(sync_change) sync_reschedule(cpu);
+    if(is_t4) timer4_reschedule(cpu);
+#endif
+    cpu.schedule_interrupt_check();
 }
 
 void atmega32u4_t::timer0_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
@@ -790,6 +959,7 @@ void atmega32u4_t::timer0_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_
     sync_reschedule(cpu);
 }
 
+ARDENS_IRAM
 void atmega32u4_t::timer0_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
     assert(ptr == reg::addr::TIFR0);
@@ -797,8 +967,46 @@ void atmega32u4_t::timer0_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_
     cpu.schedule_interrupt_check();
 }
 
+#ifdef ARDUGO_EMBEDDED
+static bool timer16_can_defer_read(const atmega32u4_t& cpu, const atmega32u4_t::timer16_t& timer)
+{
+    if(!timer16_running(cpu, timer)) return true;
+    if(timer.delayed_tifr_flags || timer.compare_block_next_tick) return false;
+    if(!timer.update_ocrN_at_top && !timer.update_ocrN_at_bottom) return true;
+    return timer.ocrNa == timer.ocrNa_buffer && timer.ocrNb == timer.ocrNb_buffer &&
+        timer.ocrNc == timer.ocrNc_buffer;
+}
+
+ARDENS_IRAM
+bool atmega32u4_t::peek_timer0(uint64_t cycle, uint8_t& result) const
+{
+    const auto& sync = timer_sync;
+    const auto& timer = timer0;
+    if(cycle < sync.prev_update_cycle || cycle >= sync.next_update_cycle ||
+       !timer0_running(*this) || timer.phase_correct || timer.count_down || timer.compare_block_next_tick ||
+       (timer.update_ocrN_at_top && (timer.ocrNa != timer.ocrNa_buffer || timer.ocrNb != timer.ocrNb_buffer)) ||
+       !timer16_can_defer_read(*this, timer1) || !timer16_can_defer_read(*this, timer3))
+        return false;
+    const auto ticks = ticks_from_sync_cycles(sync.prescaler_cycle, cycle - sync.prev_update_cycle, timer.divider);
+    if(timer.tcnt + ticks > timer.top)
+        return false;
+    result = static_cast<uint8_t>(timer.tcnt + ticks);
+    return true;
+}
+#endif
+
+ARDENS_IRAM
 uint8_t atmega32u4_t::timer0_handle_ld_tcnt(atmega32u4_t& cpu, uint16_t ptr)
 {
+#ifdef ARDUGO_EMBEDDED
+    uint8_t value;
+    if(cpu.peek_timer0(cpu.cycle_count, value))
+    {
+        // Between scheduled events the counter can be sampled without updating
+        // Timer1, Timer3, and the peripheral queue on every Arduino micros() call.
+        return value;
+    }
+#endif
     cpu.update_sync_timers();
     return cpu.data[ptr];
 }
@@ -818,6 +1026,9 @@ static void timer16_handle_st_regs(
     atmega32u4_t& cpu, atmega32u4_t::timer16_t& timer, uint16_t ptr, uint8_t x)
 {
     sync_write_barrier(cpu);
+#ifdef ARDUGO_EMBEDDED
+    timer16_flush_idle(cpu, timer, false);
+#endif
 
     if(ptr >= timer.base_addr + 0x4 &&
         ptr <= timer.base_addr + 0xd &&
@@ -872,9 +1083,35 @@ void atmega32u4_t::timer1_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_
 void atmega32u4_t::timer1_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
     assert(ptr == reg::addr::TIFR1);
+#ifdef ARDUGO_EMBEDDED
+    const bool idle_was = cpu.timer1.idle_deferred || timer16_is_idle(cpu, cpu.timer1);
+    if(idle_was)
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, cpu.timer1, false);
+    }
+#endif
     cpu.data[reg::addr::TIFR1] &= ~x;
     cpu.timer1.delayed_tifr_flags &= ~x;
+#ifdef ARDUGO_EMBEDDED
+    if(idle_was) sync_reschedule(cpu);
+#endif
     cpu.schedule_interrupt_check();
+}
+
+uint8_t atmega32u4_t::timer1_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr)
+{
+    assert(ptr == reg::addr::TIFR1);
+#ifdef ARDUGO_EMBEDDED
+    if(timer16_running(cpu, cpu.timer1))
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, cpu.timer1, true);
+    }
+#else
+    cpu.update_timer1();
+#endif
+    return cpu.data[ptr];
 }
 
 void atmega32u4_t::timer3_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
@@ -882,18 +1119,58 @@ void atmega32u4_t::timer3_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_
     timer16_handle_st_regs(cpu, cpu.timer3, ptr, x);
 }
 
+ARDENS_IRAM
 void atmega32u4_t::timer3_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
     assert(ptr == reg::addr::TIFR3);
+#ifdef ARDUGO_EMBEDDED
+    const bool idle_was = cpu.timer3.idle_deferred || timer16_is_idle(cpu, cpu.timer3);
+    if(idle_was)
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, cpu.timer3, false);
+    }
+#endif
     cpu.data[reg::addr::TIFR3] &= ~x;
     cpu.timer3.delayed_tifr_flags &= ~x;
+#ifdef ARDUGO_EMBEDDED
+    if(idle_was) sync_reschedule(cpu);
+#endif
     cpu.schedule_interrupt_check();
+}
+
+uint8_t atmega32u4_t::timer3_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr)
+{
+    assert(ptr == reg::addr::TIFR3);
+#ifdef ARDUGO_EMBEDDED
+    if(timer16_running(cpu, cpu.timer3))
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, cpu.timer3, true);
+    }
+#else
+    cpu.update_timer3();
+#endif
+    return cpu.data[ptr];
 }
 
 static uint8_t timer16_handle_ld_reg16(
     atmega32u4_t& cpu, atmega32u4_t::timer16_t& timer, uint16_t ptr)
 {
-    cpu.update_sync_timers();
+#ifdef ARDUGO_EMBEDDED
+    if(timer.idle_deferred)
+    {
+        sync_advance_to(cpu, cpu.cycle_count);
+        timer16_flush_idle(cpu, timer, true);
+    }
+    else if(((ptr == timer.base_addr + 0x4 || ptr == timer.base_addr + 0x5) &&
+             timer16_running(cpu, timer)) ||
+            !timer16_can_defer_read(cpu, timer))
+        cpu.update_sync_timers();
+#else
+    if(!timer16_can_defer_read(cpu, timer))
+        cpu.update_sync_timers();
+#endif
     if(ptr >= timer.base_addr + 0x4 &&
         ptr <= timer.base_addr + 0xd &&
         (ptr & 1) == 0)
@@ -989,7 +1266,7 @@ ARDENS_FORCEINLINE static void set_portc7(atmega32u4_t& cpu, bool c7)
     cpu.data[reg::addr::PINC] = t;
 }
 
-static void timer4_refresh_config(atmega32u4_t& cpu, bool force_active)
+ARDENS_NOINLINE static void timer4_refresh_config(atmega32u4_t& cpu, bool force_active)
 {
     auto& timer = cpu.timer4;
     uint32_t old_divider = timer.divider;
@@ -1072,6 +1349,13 @@ ARDENS_FORCEINLINE static uint64_t timer4_source_ticks(
 {
     if(cpu.pll_num12 == 0)
         return cycles;
+    if(cycles <= 0x0fffffffu) [[likely]]
+    {
+        const uint32_t t = uint32_t(cycles) * uint32_t(cpu.pll_num12) + cpu.timer4.source_cycle;
+        const uint32_t d = t / 12u;
+        cpu.timer4.source_cycle = t - d * 12u;
+        return d;
+    }
     uint64_t t = cycles * cpu.pll_num12 + cpu.timer4.source_cycle;
     uint64_t d = t / 12;
     cpu.timer4.source_cycle = uint32_t(t % 12);
@@ -1119,9 +1403,6 @@ static void timer4_tick_compare_blocked(atmega32u4_t& cpu, uint8_t& tifr)
 {
     auto& timer = cpu.timer4;
     uint32_t tcnt = timer.tcnt;
-    uint32_t ocrNa = timer.enhc ? timer.ocrNa / 2 : timer.ocrNa;
-    uint32_t ocrNb = timer.enhc ? timer.ocrNb / 2 : timer.ocrNb;
-    uint32_t ocrNd = timer.enhc ? timer.ocrNd / 2 : timer.ocrNd;
 
     if(timer.count_down)
     {
@@ -1155,7 +1436,27 @@ static void timer4_tick_compare_blocked(atmega32u4_t& cpu, uint8_t& tifr)
     timer.tcnt = tcnt & 0x07ff;
 }
 
-static void timer4_advance_ticks(atmega32u4_t& cpu, uint64_t ticks)
+#ifdef ARDUGO_EMBEDDED
+static bool timer4_can_defer(const atmega32u4_t& cpu)
+{
+    const auto& timer = cpu.timer4;
+    if(!timer4_running(cpu) ||
+       timer.start_delay_cycles != 0 ||
+       timer.compare_block_next_tick ||
+       timer.tcnt_write_pending)
+        return false;
+    constexpr uint8_t irq_mask =
+        reg::bit::TIMSK4::TOIE4 |
+        reg::bit::TIMSK4::OCIE4A |
+        reg::bit::TIMSK4::OCIE4B |
+        reg::bit::TIMSK4::OCIE4D;
+    if((cpu.data[reg::addr::TIMSK4] & irq_mask) != 0)
+        return false;
+    return cpu.sound_pwm || timer.com4a == 0;
+}
+#endif
+
+ARDENS_NOINLINE static void timer4_advance_ticks(atmega32u4_t& cpu, uint64_t ticks)
 {
     auto& timer = cpu.timer4;
     uint8_t tifr = 0;
@@ -1175,8 +1476,35 @@ static void timer4_advance_ticks(atmega32u4_t& cpu, uint64_t ticks)
     uint32_t top = timer.top;
     uint32_t com4a = timer.com4a;
 
+#ifdef ARDUGO_EMBEDDED
+    constexpr uint8_t irq4_mask =
+        reg::bit::TIMSK4::TOIE4 |
+        reg::bit::TIMSK4::OCIE4A |
+        reg::bit::TIMSK4::OCIE4B |
+        reg::bit::TIMSK4::OCIE4D;
+    const bool fast_skip_ok = (cpu.sound_pwm || com4a == 0) && !timer.tlock &&
+        (cpu.data[reg::addr::TIMSK4] & irq4_mask) == 0;
+#endif
+
     while(ticks > 0)
     {
+#ifdef ARDUGO_EMBEDDED
+        if(fast_skip_ok && tcnt == 0 && !count_down &&
+           timer.ocrNa == timer.ocrNa_next && timer.ocrNb == timer.ocrNb_next &&
+           timer.ocrNc == timer.ocrNc_next && timer.ocrNd == timer.ocrNd_next)
+        {
+            const uint32_t period_ticks = timer.phase_correct ? (top * 2u) : (top + 1u);
+            if(period_ticks > 0 && ticks > period_ticks)
+            {
+                tifr |= reg::bit::TIFR4::TOV4;
+                if(ocrNa <= top) tifr |= reg::bit::TIFR4::OCF4A;
+                if(ocrNb <= top) tifr |= reg::bit::TIFR4::OCF4B;
+                if(ocrNd <= top) tifr |= reg::bit::TIFR4::OCF4D;
+                const uint64_t skip = (ticks - 1u) / period_ticks;
+                ticks -= skip * period_ticks;
+            }
+        }
+#endif
         if(tcnt == ocrNa) tifr |= reg::bit::TIFR4::OCF4A;
         if(tcnt == ocrNb) tifr |= reg::bit::TIFR4::OCF4B;
         if(tcnt == ocrNd) tifr |= reg::bit::TIFR4::OCF4D;
@@ -1258,14 +1586,19 @@ static uint64_t timer4_next_ticks(atmega32u4_t const& cpu)
     uint32_t ocrNa = timer.enhc ? timer.ocrNa / 2 : timer.ocrNa;
     uint32_t ocrNb = timer.enhc ? timer.ocrNb / 2 : timer.ocrNb;
     uint32_t ocrNd = timer.enhc ? timer.ocrNd / 2 : timer.ocrNd;
+    const uint8_t timsk4 = cpu.data[reg::addr::TIMSK4];
+    const bool need_a = (!cpu.sound_pwm && timer.com4a != 0) ||
+                        (timsk4 & reg::bit::TIMSK4::OCIE4A);
+    const bool need_b = (timsk4 & reg::bit::TIMSK4::OCIE4B) != 0;
+    const bool need_d = (timsk4 & reg::bit::TIMSK4::OCIE4D) != 0;
     uint32_t update_tcycles = UINT32_MAX;
 
     if(timer.count_down)
     {
         update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNa);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNb);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNd);
+        if(need_a) update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNa);
+        if(need_b) update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNb);
+        if(need_d) update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tcnt - ocrNd);
     }
     else
     {
@@ -1273,9 +1606,9 @@ static uint64_t timer4_next_ticks(atmega32u4_t const& cpu)
             update_tcycles = min_nonzero(update_tcycles, timer.top, timer.top - timer.tcnt);
         else
             update_tcycles = min_nonzero(update_tcycles, timer.top, timer.tov - timer.tcnt + 1);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNa - timer.tcnt);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNb - timer.tcnt);
-        update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNd - timer.tcnt);
+        if(need_a) update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNa - timer.tcnt);
+        if(need_b) update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNb - timer.tcnt);
+        if(need_d) update_tcycles = min_nonzero(update_tcycles, timer.top, ocrNd - timer.tcnt);
         if(timer.tcnt == timer.top && timer.top != 0)
             update_tcycles = 1;
     }
@@ -1288,7 +1621,7 @@ static uint64_t timer4_next_ticks(atmega32u4_t const& cpu)
     return std::max<uint32_t>(1, update_tcycles);
 }
 
-static void timer4_reschedule(atmega32u4_t& cpu)
+ARDENS_NOINLINE static void timer4_reschedule(atmega32u4_t& cpu)
 {
     auto& timer = cpu.timer4;
     uint64_t next = UINT64_MAX;
@@ -1298,13 +1631,24 @@ static void timer4_reschedule(atmega32u4_t& cpu)
     }
     else if(timer4_running(cpu))
     {
-        uint64_t timer_ticks = timer4_next_ticks(cpu);
-        uint64_t source_ticks = source_until_timer4_ticks(
-            timer.divider_cycle, timer.divider, timer_ticks);
-        uint64_t cycles = source_cycles_until_ticks(cpu, source_ticks);
-        if(cycles != UINT64_MAX)
-            next = timer.prev_update_cycle + std::max<uint64_t>(1, cycles);
+#ifdef ARDUGO_EMBEDDED
+        if(timer4_can_defer(cpu))
+        {
+            next = UINT64_MAX;
+        }
+        else
+#endif
+        {
+            uint64_t timer_ticks = timer4_next_ticks(cpu);
+            uint64_t source_ticks = source_until_timer4_ticks(
+                timer.divider_cycle, timer.divider, timer_ticks);
+            uint64_t cycles = source_cycles_until_ticks(cpu, source_ticks);
+            if(cycles != UINT64_MAX)
+                next = timer.prev_update_cycle + std::max<uint64_t>(1, cycles);
+        }
     }
+    if(next == timer.next_update_cycle)
+        return;
     timer.next_update_cycle = next;
     cpu.peripheral_queue.reschedule(next, PQ_TIMER4);
 }
@@ -1330,19 +1674,35 @@ static void timer4_advance_to(atmega32u4_t& cpu, uint64_t target_cycle)
 
     if(timer4_running(cpu) && cycles != 0)
     {
-        uint64_t source_ticks = timer4_source_ticks(cpu, cycles);
-        uint64_t timer_ticks = ticks_from_timer4_source(
-            timer.divider_cycle, source_ticks, timer.divider);
-        if(timer.divider != 0)
-            timer.divider_cycle = uint32_t(
-                (timer.divider_cycle + source_ticks) % timer.divider);
+        const uint64_t source_ticks = timer4_source_ticks(cpu, cycles);
+        uint64_t timer_ticks = source_ticks;
+        if(timer.divider == 0)
+            timer_ticks = 0;
+        else if(timer.divider != 1)
+        {
+            if(source_ticks <= 0x7fffffffu &&
+               uint64_t(timer.divider_cycle) + source_ticks <= 0xffffffffull) [[likely]]
+            {
+                const uint32_t sum = timer.divider_cycle + uint32_t(source_ticks);
+                const uint32_t q = sum / timer.divider;
+                timer.divider_cycle = sum - q * timer.divider;
+                timer_ticks = q;
+            }
+            else
+            {
+                timer_ticks = ticks_from_timer4_source(
+                    timer.divider_cycle, source_ticks, timer.divider);
+                timer.divider_cycle = uint32_t(
+                    (timer.divider_cycle + source_ticks) % timer.divider);
+            }
+        }
         timer4_advance_ticks(cpu, timer_ticks);
     }
 
     timer.prev_update_cycle = target_cycle;
 }
 
-void atmega32u4_t::update_timer4()
+ARDENS_NOINLINE void atmega32u4_t::update_timer4()
 {
     timer4_advance_to(*this, cycle_count);
     timer4_refresh_config(*this, false);
@@ -1402,8 +1762,25 @@ void atmega32u4_t::timer4_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_
 void atmega32u4_t::timer4_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
     assert(ptr == reg::addr::TIFR4);
+#ifdef ARDUGO_EMBEDDED
+    if(timer4_can_defer(cpu))
+        timer4_write_barrier(cpu);
+#endif
     cpu.data[reg::addr::TIFR4] &= ~x;
     cpu.schedule_interrupt_check();
+}
+
+uint8_t atmega32u4_t::timer4_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr)
+{
+    assert(ptr == reg::addr::TIFR4);
+#ifdef ARDUGO_EMBEDDED
+    if(timer4_running(cpu))
+        cpu.update_timer4();
+#else
+    if(cpu.sound_pwm)
+        cpu.update_timer4();
+#endif
+    return cpu.data[ptr];
 }
 
 void atmega32u4_t::timer4_handle_st_ocrN(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
@@ -1417,6 +1794,25 @@ void atmega32u4_t::timer4_handle_st_ocrN(atmega32u4_t& cpu, uint16_t ptr, uint8_
     if(ptr == reg::addr::OCR4C) cpu.timer4.ocrNc_next = ocr;
     if(ptr == reg::addr::OCR4D) cpu.timer4.ocrNd_next = ocr;
     cpu.data[ptr] = x;
+    auto& timer = cpu.timer4;
+    if(ptr != reg::addr::OCR4C && timer.divider != 0 && timer4_powered(cpu) &&
+       !(timer.update_ocrN_at_bottom && timer.tcnt == 0) &&
+       !(timer.update_ocrN_at_top && timer.tcnt == timer.top))
+    {
+        if(ptr == reg::addr::OCR4A &&
+           (cpu.data[reg::addr::TCCR4A] & (reg::bit::TCCR4A::COM4A1 | reg::bit::TCCR4A::COM4A0)) != 0 &&
+           (cpu.data[reg::addr::TCCR4A] & reg::bit::TCCR4A::PWM4A) != 0)
+        {
+            cpu.update_sound();
+            int32_t val = timer.ocrNa_next * atmega32u4_t::SOUND_GAIN /
+                std::max<uint32_t>(1, timer.top);
+            if(timer.enhc) val /= 2;
+            if(timer.com4a == 1) val = val * 2 - atmega32u4_t::SOUND_GAIN;
+            if(timer.com4a == 3) val = atmega32u4_t::SOUND_GAIN - val;
+            cpu.sound_pwm_val = (int16_t)val;
+        }
+        return;
+    }
     timer4_refresh_config(cpu, false);
     timer4_reschedule(cpu);
 }
@@ -1448,6 +1844,10 @@ void atmega32u4_t::st_handle_gtccr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
     assert(ptr == reg::addr::GTCCR);
     sync_write_barrier(cpu);
+#ifdef ARDUGO_EMBEDDED
+    timer16_flush_idle(cpu, cpu.timer1, false);
+    timer16_flush_idle(cpu, cpu.timer3, false);
+#endif
     if(x & (reg::bit::GTCCR::PSRSYNC | reg::bit::GTCCR::TSM))
         cpu.timer_sync.prescaler_cycle = 0;
     cpu.data[reg::addr::GTCCR] = x & reg::bit::GTCCR::TSM;

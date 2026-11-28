@@ -26,11 +26,12 @@ struct Settings {
     uint8_t speed = 100;
     uint8_t fps = 30;
     uint8_t palette = 0;
-    bool oledFilter = false;
+    bool oledFilter = true;
     bool showFps = false;
 };
 
 struct Rect { int x, y, w, h; };
+class Canvas;
 
 constexpr Rect viewport(Scale scale) {
     int w = scale == Scale::Native ? 128 : scale == Scale::Double ? 256 : 320;
@@ -45,6 +46,8 @@ struct Platform {
         present(pixels, region);
         return true;
     }
+    virtual bool tryPresentGame(Canvas& canvas, const uint8_t* image, Scale scale, unsigned palette);
+    virtual void playbackStats(unsigned, unsigned) {}
     virtual void brightness(unsigned percent) = 0;
     virtual void audio(const int16_t* samples, size_t count, unsigned volume, unsigned speed) = 0;
     virtual void silence() = 0;

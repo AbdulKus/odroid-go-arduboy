@@ -13,6 +13,7 @@ set(ARDUGO_SOURCES
     ${ARDENS}/src/absim_decode.cpp
     ${ARDENS}/src/absim_disassemble.cpp
     ${ARDENS}/src/absim_execute.cpp
+    ${ARDENS}/src/absim_jit_compiler.cpp
     ${ARDENS}/src/absim_load_file.cpp
     ${ARDENS}/src/absim_merge_instrs.cpp
     ${ARDENS}/src/absim_reset.cpp

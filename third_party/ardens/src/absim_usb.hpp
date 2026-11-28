@@ -983,7 +983,7 @@ void atmega32u4_t::usb_st_handler(atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
     }
 }
 
-void atmega32u4_t::update_usb()
+ARDENS_NOINLINE void atmega32u4_t::update_usb()
 {
     usb_update_vbus(*this);
 

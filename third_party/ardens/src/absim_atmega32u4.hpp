@@ -15,6 +15,7 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
+#include "esp_cpu.h"
 #endif
 
 namespace absim
@@ -25,6 +26,7 @@ void atmega32u4_t::st_handle_prr0(
 {
     assert(ptr == reg::addr::PRR0);
     sync_write_barrier(cpu);
+    cpu.flush_idle_sync_timers();
     cpu.data[reg::addr::PRR0] = x;
     cpu.update_sync_timers();
     cpu.adc_handle_prr0(x);
@@ -36,15 +38,26 @@ void atmega32u4_t::st_handle_prr1(
 {
     assert(ptr == reg::addr::PRR1);
     sync_write_barrier(cpu);
+    cpu.flush_idle_sync_timers();
     timer4_write_barrier(cpu);
     cpu.data[reg::addr::PRR1] = x;
     cpu.update_sync_timers();
     cpu.update_timer4();
 }
 
+ARDENS_IRAM
 void atmega32u4_t::st_handle_pin(
     atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
+#ifdef ARDUGO_EMBEDDED
+    if(cpu.spi_bus && (ptr == reg::addr::PIND || ptr + 2 == cpu.spi_bus->core_state.fx_port))
+    {
+        cpu.update_spi();
+        cpu.data[ptr + 2] ^= x;
+        cpu.spi_bus->sync_spi_pins(cpu.cycle_count);
+        return;
+    }
+#endif
     if(ptr == reg::addr::PINC)
         cpu.update_sound();
     cpu.data[ptr + 2] ^= x;
@@ -60,10 +73,20 @@ void atmega32u4_t::st_handle_ddrd(
         cpu.twi_adapter->sync_bus_lines();
 }
 
+ARDENS_IRAM
 void atmega32u4_t::st_handle_port(
     atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
+#ifdef ARDUGO_EMBEDDED
+    const bool spi_pins = cpu.spi_bus && (ptr == reg::addr::PORTD || ptr == cpu.spi_bus->core_state.fx_port);
+    if(spi_pins)
+        cpu.update_spi();
+#endif
     cpu.data[ptr] = x;
+#ifdef ARDUGO_EMBEDDED
+    if(spi_pins)
+        cpu.spi_bus->sync_spi_pins(cpu.cycle_count);
+#endif
     if(ptr == reg::addr::PORTC)
     {
         cpu.update_sound();
@@ -143,8 +166,16 @@ void atmega32u4_t::update_watchdog()
         else if(csr & reg::bit::WDTCSR::WDE)
         {
             // system reset
+#ifdef ARDUGO_EMBEDDED
+            if(spi_bus)
+                update_spi();
+#endif
             update_sound();
             soft_reset();
+#ifdef ARDUGO_EMBEDDED
+            if(spi_bus)
+                spi_bus->sync_spi_pins(cycle_count);
+#endif
             return;
         }
     }
@@ -317,7 +348,7 @@ inline void atmega32u4_t::schedule_interrupt_check()
     peripheral_queue.schedule(cycle_count, PQ_INTERRUPT);
 }
 
-ARDENS_FORCEINLINE bool atmega32u4_t::check_interrupt(
+bool atmega32u4_t::check_interrupt(
     uint8_t vector, uint8_t flag, uint8_t& tifr)
 {
     if(!flag) return false;
@@ -340,7 +371,7 @@ ARDENS_FORCEINLINE bool atmega32u4_t::check_interrupt(
     return true;
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::check_all_interrupts()
+ARDENS_NOINLINE void atmega32u4_t::check_all_interrupts()
 {
     auto& sreg = data[reg::addr::SREG];
     auto& udint = data[reg::addr::UDINT];
@@ -360,7 +391,7 @@ ARDENS_FORCEINLINE void atmega32u4_t::check_all_interrupts()
 
     if(!(prev_sreg & sreg & reg::bit::SREG::I))
     {
-        if(sreg & reg::bit::SREG::I)
+        if((sreg & reg::bit::SREG::I) && has_pending_interrupt())
             peripheral_queue.schedule(cycle_count + 1, PQ_INTERRUPT);
         return;
     }
@@ -453,22 +484,20 @@ size_t atmega32u4_t::addr_to_disassembled_index(uint16_t addr)
 
 #if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
 IRAM_ATTR
+ARDENS_NOINLINE
 #endif
-ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
+uint64_t atmega32u4_t::service_peripheral_events()
 {
-    uint32_t cycles = 1;
-    just_interrupted = false;
-    auto& sreg = data[reg::addr::SREG];
-
-    constexpr uint64_t MAX_MERGED_CYCLES = 1024;
-
-    // peripheral updates
     for(;;)
     {
         auto qi = peripheral_queue.next();
         if(qi.cycle > cycle_count)
-            break;
+            return qi.cycle;
         peripheral_queue.pop();
+#ifdef ARDUGO_QUIET_TEST
+        if(size_t(qi.type) < 16)
+            ++benchmark.pq_pops[size_t(qi.type)];
+#endif
         switch(qi.type)
         {
         case PQ_SPI: update_spi(); break;
@@ -487,32 +516,65 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
         default: break;
         }
     }
+}
 
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+IRAM_ATTR
+#endif
+ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
+{
+#ifdef ARDUGO_QUIET_TEST
+    const uint32_t before_events = benchmark.measuring ? esp_cpu_get_cycle_count() : 0;
+#endif
+    uint32_t cycles = 1;
+    just_interrupted = false;
+    auto& sreg = data[reg::addr::SREG];
+    constexpr uint64_t MAX_MERGED_CYCLES = 1024;
+
+    uint64_t next_event = peripheral_queue.next_cycle();
+    if(next_event <= cycle_count)
+        next_event = service_peripheral_events();
+
+#ifdef ARDUGO_QUIET_TEST
+    const uint32_t before_instructions = benchmark.measuring ? esp_cpu_get_cycle_count() : 0;
+    if(benchmark.measuring)
+        benchmark.queue_cycles += before_instructions - before_events;
+#endif
     if(active)
     {
         // not sleeping: execute instruction(s)
 
-        int64_t max_merged_cycles = int64_t(
-            peripheral_queue.next_cycle() - cycle_count - MAX_INSTR_CYCLES);
+        const uint64_t until_event = next_event - cycle_count;
 
 #ifndef ARDENS_NO_DEBUGGER
         executing_instr_pc = pc;
 #endif
         constexpr uint16_t last_pc = 0x4000;
-        if(max_merged_cycles < 0 ||
+        if(until_event < MAX_INSTR_CYCLES ||
 #ifndef ARDENS_NO_DEBUGGER
             no_merged ||
 #endif
             false)
         {
+#ifdef ARDUGO_QUIET_TEST
+            ++benchmark.branch_short;
+            const auto nq = peripheral_queue.next().type;
+            if(size_t(nq) < 16) ++benchmark.short_pq[size_t(nq)];
+#endif
+#ifndef ARDENS_NO_DEBUGGER
             just_read = 0xffffffff;
             just_written = 0xffffffff;
+#endif
             if(pc >= last_pc)
             {
                 autobreak(AB_OOB_PC);
                 pc &= last_pc - 1;
             }
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+            auto const& i = decoded_cache.get(pc, decoded_prog.data());
+#else
             auto const& i = decoded_prog[pc];
+#endif
             prev_sreg = sreg;
             cycles = INSTR_MAP[i.func](*this, i);
             assert(cycles <= MAX_INSTR_CYCLES);
@@ -520,14 +582,32 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
         }
         else
         {
-            uint64_t tcycles = cycle_count;
             int32_t cycles_max = static_cast<int32_t>(std::min<uint64_t>(
-                max_merged_cycles, MAX_MERGED_CYCLES));
+                until_event - MAX_INSTR_CYCLES, MAX_MERGED_CYCLES));
 
             // this can happen here because if SREG I-bit is ever changed
             // it'll break out of the loop anyway
             prev_sreg = sreg;
-            
+#ifdef ESP_PLATFORM
+#ifdef ARDUGO_QUIET_TEST
+            ++benchmark.branch_jit;
+            cycles = execute_jit(static_cast<int32_t>(
+                std::min<uint64_t>(until_event, MAX_MERGED_CYCLES)));
+            if(cycles == 0)
+            {
+                ++benchmark.branch_jit_fb;
+                cycles = execute_merged(cycles_max);
+            }
+#else
+            cycles = execute_jit(static_cast<int32_t>(
+                std::min<uint64_t>(until_event, MAX_MERGED_CYCLES)));
+            if(cycles == 0)
+                cycles = execute_merged(cycles_max);
+#endif
+#elif defined(ARDUGO_EMBEDDED)
+            cycles = execute_merged(cycles_max);
+#else
+            uint64_t tcycles = cycle_count;
             io_reg_accessed = false;
             do
             {
@@ -536,11 +616,7 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
                     autobreak(AB_OOB_PC);
                     pc &= last_pc - 1;
                 }
-#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
-                auto const& i = merged_instruction(pc);
-#else
                 auto const& i = merged_prog[pc];
-#endif
                 auto const old_sreg = sreg;
                 auto instr_cycles = INSTR_MAP[i.func](*this, i);
                 bool const i_changed = (old_sreg ^ sreg) & reg::bit::SREG::I;
@@ -551,10 +627,14 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
                 cycles_max -= instr_cycles;
             } while(cycles_max > 0);
             cycles = uint32_t(cycle_count - tcycles);
+#endif
         }
     }
     else if(wakeup_cycles > 0)
     {
+#ifdef ARDUGO_QUIET_TEST
+        ++benchmark.branch_waking;
+#endif
         prev_sreg = sreg;
         // sleeping but waking up from an interrupt
 
@@ -572,11 +652,14 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
     }
     else
     {
+#ifdef ARDUGO_QUIET_TEST
+        ++benchmark.branch_sleep;
+#endif
         // sleeping and not waking up from an interrupt
         prev_sreg = sreg;
 
         // boost executed cycles to speed up timer code
-        uint64_t t = std::max(cycle_count + 1, peripheral_queue.next_cycle());
+        uint64_t t = std::max(cycle_count + 1, next_event);
         t -= cycle_count;
         t = std::min<uint64_t>(t, MAX_MERGED_CYCLES);
         cycles = (uint32_t)t;
@@ -585,11 +668,15 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
 
     // if interrupts were just enabled, schedule interrupt check for next cycle
     // (allows next instruction to execute)
-    if(~prev_sreg & sreg & reg::bit::SREG::I)
+    if((~prev_sreg & sreg & reg::bit::SREG::I) && has_pending_interrupt())
         peripheral_queue.schedule(cycle_count + 1, PQ_INTERRUPT);
 
 #ifndef ARDUGO_EMBEDDED
     update_sound();
+#endif
+#ifdef ARDUGO_QUIET_TEST
+    if(benchmark.measuring)
+        benchmark.instruction_cycles += esp_cpu_get_cycle_count() - before_instructions;
 #endif
 
     return cycles;
@@ -597,6 +684,7 @@ ARDENS_FORCEINLINE uint32_t atmega32u4_t::advance_cycle()
 
 void atmega32u4_t::update_all()
 {
+    flush_idle_sync_timers();
     update_sync_timers();
     update_timer4();
     update_usb();

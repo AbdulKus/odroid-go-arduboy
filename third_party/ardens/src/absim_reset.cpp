@@ -52,7 +52,10 @@ void atmega32u4_t::reset()
     st_handlers[reg::addr::PINE] = st_handle_pin;
     st_handlers[reg::addr::PINF] = st_handle_pin;
 
-    //st_handlers[reg::addr::PORTB] = st_handle_port;
+#ifdef ARDUGO_EMBEDDED
+    if(spi_bus)
+        st_handlers[spi_bus->core_state.fx_port] = st_handle_port;
+#endif
     st_handlers[reg::addr::PORTC] = st_handle_port;
     st_handlers[reg::addr::DDRD] = st_handle_ddrd;
     st_handlers[reg::addr::PORTD] = st_handle_port;
@@ -103,6 +106,11 @@ void atmega32u4_t::reset()
         ld_handlers[i] = timer3_handle_ld_regs;
     ld_handlers[reg::addr::TCNT4] = timer4_handle_ld_tcnt;
     ld_handlers[reg::addr::TC4H] = timer4_handle_ld_tcnt;
+#ifdef ARDUGO_EMBEDDED
+    ld_handlers[reg::addr::TIFR1] = timer1_handle_ld_tifr;
+    ld_handlers[reg::addr::TIFR3] = timer3_handle_ld_tifr;
+    ld_handlers[reg::addr::TIFR4] = timer4_handle_ld_tifr;
+#endif
 
     st_handlers[reg::addr::UHWCON] = usb_st_handler;
     st_handlers[reg::addr::USBCON] = usb_st_handler;
@@ -246,6 +254,7 @@ void atmega32u4_t::soft_reset()
 
     sound_prev_cycle = cycle_count;
     sound_cycle = 0;
+    sound_acc = 0;
     sound_enabled = 0;
     sound_pwm = false;
     sound_pwm_val = 0;
@@ -269,6 +278,13 @@ void atmega32u4_t::soft_reset()
     peripheral_queue.schedule(watchdog_next_cycle, PQ_WATCHDOG);
 
     data[reg::addr::OSCCAL] = 0x6d;
+
+#ifdef ARDUGO_EMBEDDED
+    ++jit_decode_gen;
+    jit_prog_ptr = prog.data();
+    jit_spm_active = 0;
+    jit_invalidate();
+#endif
 
     peripheral_queue.clear();
 }

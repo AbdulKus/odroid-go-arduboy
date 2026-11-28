@@ -255,7 +255,7 @@ static std::string load_hex(arduboy_t& a, std::istream& f, bool bootloader = fal
     auto& cpu = a.core_state.cpu;
     if(!bootloader)
     {
-        memset(&cpu.prog, 0, atmega32u4_t::PROGRAM_FLASH_BYTES);
+        memset(cpu.prog.data(), 0, atmega32u4_t::PROGRAM_FLASH_BYTES);
         std::fill(cpu.decoded_prog.begin(), cpu.decoded_prog.end(), avr_instr_t{});
         std::fill(cpu.disassembled_prog.begin(), cpu.disassembled_prog.end(), disassembled_instr_t{});
         memset(&cpu.eeprom, 0xff, sizeof(cpu.eeprom));
@@ -668,7 +668,7 @@ static std::string load_elf(arduboy_t& a, std::istream& f, std::string const& fn
 
     a.program_state.elf.reset();
     auto& cpu = a.core_state.cpu;
-    memset(&cpu.prog, 0, sizeof(cpu.prog));
+    memset(cpu.prog.data(), 0, cpu.prog.size());
     std::fill(cpu.decoded_prog.begin(), cpu.decoded_prog.end(), avr_instr_t{});
     std::fill(cpu.disassembled_prog.begin(), cpu.disassembled_prog.end(), disassembled_instr_t{});
     memset(&a.debugger_state.breakpoints, 0, sizeof(a.debugger_state.breakpoints));

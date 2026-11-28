@@ -1,5 +1,6 @@
 #include "app.hpp"
 #include "files.hpp"
+#include "audio.hpp"
 
 #include <algorithm>
 #include <array>
@@ -197,6 +198,14 @@ void testViewport() {
         require(lit == box.w * box.h && box.w == 2 * box.h &&
                 box.x * 2 + box.w == go::ScreenW && box.y * 2 + box.h == go::ScreenH, "Incorrect viewport geometry");
     }
+    for (unsigned p = 0; p < go::PaletteCount; ++p) {
+        const go::GamePixels gp(go::GameW, p, false);
+        require(gp.colors[0] != gp.colors[255], "Palette background and foreground collided");
+        if (p >= 6 && p <= 9) {
+            require(gp.colors[85] != gp.colors[0] && gp.colors[170] != gp.colors[255] &&
+                    gp.colors[85] != gp.colors[170], "GBC halftone stops must be distinct");
+        }
+    }
 }
 
 void extraRoms(const fs::path& folder) {
@@ -217,14 +226,78 @@ void extraRoms(const fs::path& folder) {
 
 }
 
+void testSettingsMigration(const fs::path& dir) {
+    fs::create_directories(dir);
+    const fs::path path = dir / "settings.dat";
+    std::array<uint8_t, 12> ags1{'A', 'G', 'S', '1', 80, 75, 1, 100, 60, 0, 0x02, 0};
+    for (size_t i = 4; i < 11; ++i) ags1[11] ^= ags1[i];
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(ags1.data()), ags1.size());
+    }
+    const auto migrated = go::readSettings(path.string());
+    require(migrated.oledFilter && migrated.showFps && migrated.fps == 60,
+        "Legacy AGS1 settings should enable oledFilter");
+
+    go::Settings explicitOff = migrated;
+    explicitOff.oledFilter = false;
+    require(go::writeSettings(path.string(), explicitOff), "writeSettings AGS2 failed");
+    const auto roundtrip = go::readSettings(path.string());
+    require(!roundtrip.oledFilter && roundtrip.showFps && roundtrip.fps == 60,
+        "AGS2 should preserve explicit oledFilter=false");
+    for (uint8_t rate : {uint8_t(40), uint8_t(45)}) {
+        go::Settings fpsTest = roundtrip;
+        fpsTest.fps = rate;
+        fpsTest.palette = go::PaletteCount - 1;
+        require(go::writeSettings(path.string(), fpsTest), "writeSettings 40/45 fps failed");
+        const auto reloaded = go::readSettings(path.string());
+        require(reloaded.fps == rate && reloaded.palette == fpsTest.palette,
+            "40/45 fps or extended palette did not roundtrip");
+    }
+}
+
+void testDacConversion() {
+    go::DacConverter dac;
+    int64_t quietEnergy = 0, loudEnergy = 0;
+    for (unsigned volume : {5u, 50u, 100u}) {
+        dac.reset();
+        int64_t energy = 0;
+        for (unsigned i = 0; i < 32000; ++i) {
+            // Two mixed square-wave channels, with a maximum magnitude of 2000.
+            const int sample = (i % 32 < 16 ? 1000 : -1000) +
+                               (i % 50 < 25 ? 1000 : -1000);
+            const auto value = dac.convert(sample, volume);
+            require(value > 0 && value < 255, "Mixed sound saturated the DAC");
+            const int level = int(value) - 128;
+            energy += int64_t(level) * level;
+        }
+        if (volume == 5) quietEnergy = energy;
+        if (volume == 50) loudEnergy = energy;
+        for (unsigned i = 0; i < 16000; ++i) {
+            const auto value = dac.convert(0, volume);
+            if (i >= 12000) require(value == 128, "DAC error feedback generated noise during silence");
+        }
+    }
+    require(quietEnergy > 0 && quietEnergy * 100 < loudEnergy,
+            "Minimum volume lost its quiet dynamic range");
+    dac.reset();
+    for (unsigned i = 0; i < 16000; ++i) {
+        const auto value = dac.convert(2000, 100);
+        if (i >= 12000) require(value == 128, "DAC retained DC noise");
+    }
+    require(dac.convert(2000, 0) == 128, "Zero volume should produce the DAC midpoint");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "--roms") {
         extraRoms(argv[2]);
         return 0;
     }
     if (argc != 3) return 2;
+    testDacConversion();
     testCore(fs::path(argv[1]) / "core");
     testLargeCatalog(fs::path(argv[1]) / "large");
+    testSettingsMigration(fs::path(argv[1]) / "settings-migration");
     if (std::string_view(argv[2]) != "-") fs::create_directories(argv[2]);
     testUi(fs::path(argv[1]) / "ui", std::string_view(argv[2]) == "-" ? fs::path{} : fs::path(argv[2]));
     testViewport();

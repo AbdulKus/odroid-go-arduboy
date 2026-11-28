@@ -24,6 +24,10 @@ public:
     const std::vector<int16_t>& samples() const;
     uint64_t cycles() const;
     const std::string& title() const;
+#ifdef ARDUGO_QUIET_TEST
+    void clearBenchmark();
+    void reportBenchmark() const;
+#endif
 
     bool flush();
     bool reset();

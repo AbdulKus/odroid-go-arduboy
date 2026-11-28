@@ -3,6 +3,7 @@
 namespace absim
 {
 
+ARDENS_IRAM
 void atmega32u4_t::spi_handle_st_spcr_or_spsr(
     atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
@@ -38,6 +39,8 @@ void atmega32u4_t::spi_handle_st_spcr_or_spsr(
     constexpr uint8_t MSTR = reg::bit::SPCR::MSTR;
     if(!(spcr & MSTR))
         cpu.spi_busy = false;
+    if((spcr & reg::bit::SPCR::SPIE) && (cpu.spi_busy || cpu.spi_flag_cycle != UINT64_MAX))
+        cpu.update_spi();
 }
 
 static uint8_t reverse_bits(uint8_t byte)
@@ -80,25 +83,12 @@ static uint8_t reverse_bits(uint8_t byte)
     return REVERSE[byte];
 }
 
-static void spi_access_spdr(atmega32u4_t& cpu)
-{
-    cpu.update_spi();
-    if(cpu.spsr_read_after_transmit)
-    {
-        cpu.spsr_read_after_transmit = false;
-        cpu.data[reg::addr::SPSR] &= ~reg::bit::SPSR::SPIF;
-    }
-    if(cpu.spi_wcol_read)
-    {
-        cpu.spi_wcol_read = false;
-        cpu.data[reg::addr::SPSR] &= ~reg::bit::SPSR::WCOL;
-    }
-}
-
+ARDENS_IRAM
 void atmega32u4_t::spi_handle_st_spdr(
     atmega32u4_t& cpu, uint16_t ptr, uint8_t x)
 {
-    spi_access_spdr(cpu);
+    cpu.update_spi();
+    cpu.acknowledge_spi_flags();
     uint8_t& spsr = cpu.data[reg::addr::SPSR];
     constexpr uint8_t WCOL = reg::bit::SPSR::WCOL;
 
@@ -138,30 +128,31 @@ void atmega32u4_t::spi_handle_st_spdr(
             cpu.spi_transmit_zero_cycle - (cpu.spi_fast_transfer ? 1 : 0);
         cpu.spi_data_latched = false;
         cpu.spi_busy = true;
-        cpu.peripheral_queue.schedule(cpu.spi_done_cycle, PQ_SPI);
+        if(!cpu.spi_bus || (cpu.data[reg::addr::SPCR] & reg::bit::SPCR::SPIE) || !cpu.active)
+            cpu.peripheral_queue.schedule(cpu.spi_done_cycle, PQ_SPI);
     }
 }
 
+ARDENS_IRAM
 uint8_t atmega32u4_t::spi_handle_ld_spsr(atmega32u4_t& cpu, uint16_t ptr)
 {
     cpu.update_spi();
-    auto r = cpu.data[reg::addr::SPSR];
-    if(r & reg::bit::SPSR::SPIF)
-        cpu.spsr_read_after_transmit = true;
-    if(r & reg::bit::SPSR::WCOL)
-        cpu.spi_wcol_read = true;
-    return r;
+    return cpu.read_spi_status();
 }
 
+ARDENS_IRAM
 uint8_t atmega32u4_t::spi_handle_ld_spdr(atmega32u4_t& cpu, uint16_t ptr)
 {
-    spi_access_spdr(cpu);
+    cpu.update_spi();
+    cpu.acknowledge_spi_flags();
     assert(ptr == reg::addr::SPDR);
     return cpu.data[reg::addr::SPDR];
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::update_spi()
+ARDENS_IRAM
+void atmega32u4_t::update_spi()
 {
+    const bool need_pq = !spi_bus || (data[reg::addr::SPCR] & reg::bit::SPCR::SPIE) || !active;
     // Service a preceding transfer's delayed flag before finishing the current
     // one. An SPSR read remains armed across either completion; only the flags
     // it observed set are acknowledged by the subsequent SPDR access.
@@ -176,6 +167,10 @@ ARDENS_FORCEINLINE void atmega32u4_t::update_spi()
             spi_transmit_zero_cycle - (spi_fast_transfer ? 1 : 0);
         if(!spi_data_latched && cycle_count >= receive_cycle)
         {
+#ifdef ARDUGO_EMBEDDED
+            if(spi_bus)
+                spi_datain_byte = spi_bus->exchange_spi_byte_fast(spi_data_byte, receive_cycle);
+#endif
             data[reg::addr::SPDR] = spi_datain_byte;
             spi_data_latched = true;
         }
@@ -189,11 +184,11 @@ ARDENS_FORCEINLINE void atmega32u4_t::update_spi()
                 spi_flag_cycle = UINT64_MAX;
             }
         }
-        else
+        else if(need_pq)
             peripheral_queue.schedule(
                 spi_data_latched ? spi_transmit_zero_cycle : receive_cycle, PQ_SPI);
     }
-    if(spi_flag_cycle != UINT64_MAX)
+    if(spi_flag_cycle != UINT64_MAX && need_pq)
         peripheral_queue.schedule(spi_flag_cycle, PQ_SPI);
 }
 

@@ -23,7 +23,6 @@ App::App(Platform& platform, std::string storageRoot)
     : platform_(platform), catalog_(std::move(storageRoot)) {}
 
 void App::start() {
-    platform_.brightness(settings_.brightness);
     mount();
     draw();
 }
@@ -31,6 +30,7 @@ void App::start() {
 void App::mount() {
     if (!platform_.mountStorage() || !scan()) {
         show(Screen::Storage);
+        platform_.brightness(settings_.brightness);
         return;
     }
     settings_ = readSettings(settingsPath(catalog_));
@@ -41,6 +41,7 @@ void App::mount() {
 bool App::scan(uint64_t keep) {
     drawActivity(canvas_, "Library", "Scanning games...");
     platform_.present(canvas_.data(), FullScreen);
+    platform_.brightness(settings_.brightness);
     if (!catalog_.scan()) return false;
     rebuild(keep);
     return true;
@@ -121,25 +122,27 @@ void App::notice(std::string title, std::string detail) {
 }
 
 void App::changeSetting(int delta) {
-    const auto stepped = [delta](int current, int min, int max) {
-        return static_cast<uint8_t>(std::clamp(current + 10 * delta, min, max));
+    const auto stepped = [delta](int current, int min, int max, int step) {
+        return static_cast<uint8_t>(std::clamp(current + step * delta, min, max));
     };
     switch (settingsRow_) {
     case 0:
-        settings_.brightness = stepped(settings_.brightness, 10, 100);
+        settings_.brightness = stepped(settings_.brightness, 10, 100, 10);
         platform_.brightness(settings_.brightness);
         break;
-    case 1: settings_.volume = stepped(settings_.volume, 0, 100); break;
+    case 1: settings_.volume = stepped(settings_.volume, 0, 100, 5); break;
     case 2: settings_.scale = static_cast<Scale>(wrap(int(settings_.scale) + delta, 3)); break;
     case 3: settings_.speed = std::clamp(int(settings_.speed) + delta * 25, 50, 125); break;
     case 4: {
-        const unsigned index = settings_.fps == 20 ? 0 : settings_.fps == 30 ? 1 : 2;
-        constexpr uint8_t rates[] = {20, 30, 60};
-        settings_.fps = rates[wrap(int(index) + delta, 3)];
+        constexpr uint8_t rates[] = {20, 30, 40, 45, 60};
+        unsigned index = 0;
+        for (unsigned i = 0; i < std::size(rates); ++i)
+            if (rates[i] == settings_.fps) { index = i; break; }
+        settings_.fps = rates[wrap(int(index) + delta, int(std::size(rates)))];
         break;
     }
     case 5: settings_.oledFilter = !settings_.oledFilter; break;
-    case 6: settings_.palette = wrap(int(settings_.palette) + delta, 3); break;
+    case 6: settings_.palette = wrap(int(settings_.palette) + delta, PaletteCount); break;
     case 7: settings_.showFps = !settings_.showFps; break;
     }
     dirty_ = true;
@@ -180,7 +183,7 @@ void App::finishConfirm() {
 void App::tick(uint64_t nowUs, uint16_t buttons) {
     now_ = nowUs;
     // Discard long stalls (for example an SD write) and deliver sound between short AVR slices.
-    unsigned elapsed = lastTick_ ? std::min<uint64_t>(nowUs - lastTick_, 12000) : 0;
+    unsigned elapsed = lastTick_ ? std::min<uint64_t>(nowUs - lastTick_, 20000) : 0;
     lastTick_ = nowUs;
     uint16_t pressed = buttons & ~previousKeys_;
     previousKeys_ = buttons;
@@ -331,10 +334,17 @@ void App::tick(uint64_t nowUs, uint16_t buttons) {
 
 void App::drawGameUpdates(uint64_t nowUs) {
     if (settings_.showFps) {
-        if (!fpsSince_) fpsSince_ = nowUs;
+        if (!fpsSince_) {
+            fpsSince_ = nowUs;
+            fpsStartCycles_ = core_.cycles();
+        }
         const uint64_t window = nowUs - fpsSince_;
         if (window >= 1000000) {
             const unsigned fps = (submittedFrames_ * 1000000ULL + window / 2) / window;
+            const auto cycles = core_.cycles();
+            const auto advanced = cycles >= fpsStartCycles_ ? cycles - fpsStartCycles_ : 0;
+            platform_.playbackStats(fps, advanced * 100 / (16 * window));
+            fpsStartCycles_ = cycles;
             if (fps != measuredFps_) {
                 measuredFps_ = fps;
                 fpsDirty_ = true;
@@ -356,8 +366,7 @@ void App::drawGameUpdates(uint64_t nowUs) {
     if (nextFrame_ <= nowUs) nextFrame_ = nowUs + period;
     const auto* pixels = core_.pixels();
     if (std::memcmp(pixels, lastFrame_.data(), lastFrame_.size()) != 0) {
-        canvas_.frame(pixels, settings_.scale, settings_.palette);
-        if (platform_.tryPresent(canvas_.data(), viewport(settings_.scale))) {
+        if (platform_.tryPresentGame(canvas_, pixels, settings_.scale, settings_.palette)) {
             std::memcpy(lastFrame_.data(), pixels, lastFrame_.size());
             if (settings_.showFps) ++submittedFrames_;
         } else {

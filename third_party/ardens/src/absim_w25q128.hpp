@@ -10,6 +10,10 @@ namespace absim
 
 void w25q128_t::erase_all_data()
 {
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    read_sectors.fill(nullptr);
+    read_sector_indices.fill(NUM_SECTORS);
+#endif
     for(auto& s : sectors) s.reset();
     write_bytes(0, ARDENS_BOOT_FLASHCART, sizeof(ARDENS_BOOT_FLASHCART));
     sectors_modified.reset();
@@ -29,6 +33,7 @@ bool w25q128_t::has_empty_page_range() const
         max_page == EMPTY_PAGE_SENTINEL;
 }
 
+ARDENS_IRAM
 uint8_t w25q128_t::read_byte(size_t addr)
 {
     if(addr >= DATA_BYTES)
@@ -36,8 +41,44 @@ uint8_t w25q128_t::read_byte(size_t addr)
 
     size_t sector_index = addr / SECTOR_BYTES;
     size_t byte_index = addr % SECTOR_BYTES;
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    const size_t slot = sector_index & 3u;
+    if(!read_sectors[slot] || read_sector_indices[slot] != sector_index)
+    {
+        read_sectors[slot] = sectors[sector_index].get();
+        read_sector_indices[slot] = sector_index;
+    }
+    return read_sectors[slot] ? (*read_sectors[slot])[byte_index] : 0xff;
+#else
     auto& sector = sectors[sector_index];
     return sector ? (*sector)[byte_index] : 0xff;
+#endif
+}
+
+ARDENS_NOINLINE ARDENS_IRAM
+void w25q128_t::fill_cache64(size_t base, uint8_t* dst)
+{
+    if(base >= DATA_BYTES) [[unlikely]]
+    {
+        memset(dst, 0xff, 64);
+        return;
+    }
+    const size_t sector_index = base / SECTOR_BYTES;
+    const size_t slot = sector_index & 3u;
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    if(!read_sectors[slot] || read_sector_indices[slot] != sector_index)
+    {
+        read_sectors[slot] = sectors[sector_index].get();
+        read_sector_indices[slot] = sector_index;
+    }
+    const sector_t* sector = read_sectors[slot];
+#else
+    const sector_t* sector = sectors[sector_index].get();
+#endif
+    if(sector)
+        memcpy(dst, &(*sector)[base & (SECTOR_BYTES - 1)], 64);
+    else
+        memset(dst, 0xff, 64);
 }
 
 void w25q128_t::write_byte(size_t addr, uint8_t data)
@@ -45,6 +86,7 @@ void w25q128_t::write_byte(size_t addr, uint8_t data)
     if(addr >= DATA_BYTES)
         return;
 
+    ++data_gen;
     size_t sector_index = addr / SECTOR_BYTES;
     size_t byte_index = addr % SECTOR_BYTES;
     auto& sector = sectors[sector_index];
@@ -66,6 +108,7 @@ void w25q128_t::write_bytes(size_t addr, uint8_t const* data, size_t bytes)
     if(addr >= DATA_BYTES)
         return;
     bytes = std::min(bytes, DATA_BYTES - addr);
+    ++data_gen;
 
     while(bytes > 0)
     {
@@ -106,11 +149,17 @@ void w25q128_t::reset()
     sectors_dirty = false;
 
     busy_error = false;
+    ++data_gen;
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    read_sectors.fill(nullptr);
+    read_sector_indices.fill(NUM_SECTORS);
+#endif
     for(auto& s : sectors_modified_data)
         s.reset();
 }
 
-ARDENS_FORCEINLINE void w25q128_t::set_enabled(bool e)
+ARDENS_IRAM
+void w25q128_t::set_enabled(bool e)
 {
     if(enabled != e)
     {
@@ -158,9 +207,25 @@ ARDENS_FORCEINLINE void w25q128_t::track_page()
     }
 }
 
-ARDENS_FORCEINLINE uint8_t w25q128_t::spi_transceive(uint8_t byte)
+ARDENS_FORCEINLINE
+uint8_t w25q128_t::spi_transceive(uint8_t byte)
 {
     if(!enabled) return 0;
+
+    if(reading >= 4) [[likely]]
+    {
+        busy_error = false;
+        const uint8_t data_to_send = read_byte(current_addr);
+        current_addr = (current_addr + 1) & 0xffffffu;
+        return data_to_send;
+    }
+
+    return spi_transceive_slow(byte);
+}
+
+ARDENS_IRAM
+uint8_t w25q128_t::spi_transceive_slow(uint8_t byte)
+{
 
     uint8_t data_to_send = 0;
     busy_error = false;
@@ -172,13 +237,6 @@ ARDENS_FORCEINLINE uint8_t w25q128_t::spi_transceive(uint8_t byte)
             current_addr = (current_addr << 8) | byte;
             current_addr &= 0xffffff;
             ++reading;
-        }
-        else if(reading >= 4)
-        {
-            //track_page();
-            data_to_send = read_byte(current_addr);
-            ++current_addr;
-            current_addr &= 0xffffff;
         }
     }
     else if(programming)
@@ -226,6 +284,7 @@ ARDENS_FORCEINLINE uint8_t w25q128_t::spi_transceive(uint8_t byte)
             if(current_addr >= save_start)
 #endif
             {
+                ++data_gen;
                 auto& sector = sectors[current_addr / SECTOR_BYTES];
                 if(sector)
                     memset(sector->data(), 0xff, SECTOR_BYTES);

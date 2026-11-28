@@ -1,4 +1,0 @@
-[mapping:ardens_instructions]
-archive: libmain.a
-entries:
-    absim_execute (noflash)

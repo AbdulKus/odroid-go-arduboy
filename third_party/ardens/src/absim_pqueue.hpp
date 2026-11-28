@@ -57,6 +57,8 @@ struct pqueue
 
     ARDENS_FORCEINLINE void reschedule(uint64_t cycle, pqueue_type type)
     {
+        if(cycles[type] == cycle)
+            return;
         cycles[type] = cycle;
         if(cycle == UINT64_MAX)
             scheduled &= ~(1 << type);

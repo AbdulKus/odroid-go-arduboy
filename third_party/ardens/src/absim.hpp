@@ -82,6 +82,7 @@ struct twi_wire_state_t
 };
 
 struct arduboy_t;
+struct arduboy_core_state_t;
 struct atmega32u4_t;
 
 struct i2c_bus_participant_t
@@ -368,7 +369,7 @@ private:
     atmega32u4_t* local_cpu(uint8_t endpoint) const;
 };
 
-struct avr_instr_t
+struct alignas(uint32_t) avr_instr_t
 {
     uint16_t word;
     uint8_t src;
@@ -381,6 +382,30 @@ struct avr_instr_t
     uint8_t m2;
 };
 
+ARDENS_FORCEINLINE bool instr_is_two_words(avr_instr_t const i)
+{
+    return
+        i.func == INSTR_CALL ||
+        i.func == INSTR_JMP ||
+        i.func == INSTR_LDS ||
+        i.func == INSTR_STS;
+}
+
+ARDENS_FORCEINLINE bool instr_is_call(avr_instr_t const i)
+{
+    return
+        i.func == INSTR_CALL ||
+        i.func == INSTR_RCALL ||
+        i.func == INSTR_ICALL;
+}
+
+ARDENS_FORCEINLINE bool instr_is_ret(avr_instr_t const i)
+{
+    return
+        i.func == INSTR_RET ||
+        i.func == INSTR_RETI;
+}
+
 struct atmega32u4_t
 {
     static constexpr size_t PROG_SIZE_BYTES = 32 * 1024;
@@ -389,17 +414,35 @@ struct atmega32u4_t
         PROG_SIZE_BYTES - BOOTLOADER_FLASH_BYTES;
     static constexpr size_t DATA_SIZE_BYTES = 2560 + 256;
 
-    std::array<uint8_t, DATA_SIZE_BYTES> data;
+    // Keep the frequently used execution state within immediate load/store
+    // range on Xtensa, ahead of the guest flash and peripheral buffers.
+    uint64_t cycle_count;
+#ifdef ARDUGO_EMBEDDED
+    uint64_t jit_batch_end;
+    std::array<void*, 17> jit_helpers;
+    const uint8_t* jit_prog_ptr;
+    int32_t jit_irq_enable_rem;
+    uint32_t jit_decode_gen;
+    uint8_t jit_spm_active;
+#endif
+    uint32_t just_read;
+    uint32_t just_written;
+    uint16_t pc;
+    uint16_t executing_instr_pc;
+    uint8_t prev_sreg;
+    uint8_t wakeup_cycles;
+    bool active;
+    bool just_interrupted;
+    bool io_reg_accessed;
+    alignas(uint16_t) std::array<uint8_t, DATA_SIZE_BYTES> data;
 
     inline uint8_t& gpr(uint8_t n)
     {
+#ifndef ARDENS_NO_DEBUGGER
         assert(n < 32);
+#endif
         return data[n];
     }
-
-    uint32_t just_read;
-    uint32_t just_written;
-    bool io_reg_accessed;
 
     using ld_handler_t = uint8_t(*)(atmega32u4_t& cpu, uint16_t ptr);
     using st_handler_t = void(*)(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
@@ -410,14 +453,24 @@ struct atmega32u4_t
     ARDENS_FORCEINLINE uint8_t ld(uint16_t ptr)
     {
         check_deref(ptr);
+#ifndef ARDENS_NO_DEBUGGER
         if(!merged)
             just_read = ptr;
+#endif
         if(ptr < ld_handlers.size())
         {
+#ifndef ARDUGO_EMBEDDED
             if(merged)
                 io_reg_accessed = true;
+#endif
             if(ld_handlers[ptr])
+            {
+#ifdef ARDUGO_EMBEDDED
+                if(merged)
+                    io_reg_accessed = true;
+#endif
                 return ld_handlers[ptr](*this, ptr);
+            }
         }
         return ptr < data.size() ? data[ptr] : 0x00;
     }
@@ -426,14 +479,24 @@ struct atmega32u4_t
     ARDENS_FORCEINLINE void st(uint16_t ptr, uint8_t x)
     {
         check_deref(ptr);
+#ifndef ARDENS_NO_DEBUGGER
         if(!merged)
             just_written = ptr;
+#endif
         if(ptr < st_handlers.size())
         {
+#ifndef ARDUGO_EMBEDDED
             if(merged)
                 io_reg_accessed = true;
+#endif
             if(st_handlers[ptr])
+            {
+#ifdef ARDUGO_EMBEDDED
+                if(merged)
+                    io_reg_accessed = true;
+#endif
                 return st_handlers[ptr](*this, ptr, x);
+            }
         }
         if(ptr < data.size()) data[ptr] = x;
     }
@@ -468,11 +531,6 @@ struct atmega32u4_t
     ARDENS_FORCEINLINE uint16_t x_word() { return gpr_word(26); }
     ARDENS_FORCEINLINE uint16_t y_word() { return gpr_word(28); }
     ARDENS_FORCEINLINE uint16_t z_word() { return gpr_word(30); }
-
-    // false if the cpu is sleeping
-    bool active;
-    uint8_t wakeup_cycles; // for tracking interrupt wakeup delay
-    bool just_interrupted;
 
     ARDENS_FORCEINLINE uint16_t sp()
     {
@@ -571,18 +629,15 @@ struct atmega32u4_t
         return x;
     }
 
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    std::vector<uint8_t> prog = std::vector<uint8_t>(PROG_SIZE_BYTES);
+#else
     std::array<uint8_t, PROG_SIZE_BYTES> prog; // program flash memory
+#endif
     std::array<uint8_t, 1024>  eeprom; // EEPROM
     std::bitset<1024> eeprom_modified_bytes;
     bool eeprom_modified;
     bool eeprom_dirty;
-
-    // SREG after previous instruction (used for interrupt bit)
-    uint8_t prev_sreg;
-
-    uint16_t pc;                       // program counter
-
-    uint16_t executing_instr_pc;
 
 #ifdef ARDUGO_EMBEDDED
     static constexpr size_t MAX_STACK_FRAMES = 0;
@@ -631,18 +686,32 @@ struct atmega32u4_t
 #ifdef ESP_PLATFORM
     // Code is decoded into PSRAM. Keep frequently executed instruction blocks
     // beside the AVR registers in internal memory, without shrinking AVR flash.
-    static constexpr size_t MERGED_CACHE_BLOCK = 16;
-    static constexpr size_t MERGED_CACHE_SLOTS = 64;
-    std::array<std::array<avr_instr_t, MERGED_CACHE_BLOCK>, MERGED_CACHE_SLOTS> merged_cache;
-    std::array<uint16_t, MERGED_CACHE_SLOTS> merged_cache_tags;
-    void fill_merged_cache(uint16_t block, size_t slot);
+    static constexpr size_t INSTR_CACHE_BLOCK = 16;
+    static constexpr size_t MERGED_CACHE_SLOTS = 32;
+    static constexpr size_t DECODED_CACHE_SLOTS = 16;
+    template<size_t Slots>
+    struct instruction_cache_t
+    {
+        std::array<std::array<avr_instr_t, INSTR_CACHE_BLOCK>, Slots> entries;
+        std::array<uint16_t, Slots> tags;
+
+        ARDENS_FORCEINLINE const avr_instr_t& get(uint16_t address, const avr_instr_t* program)
+        {
+            const uint16_t block = address / INSTR_CACHE_BLOCK;
+            const size_t slot = block % Slots;
+            if(tags[slot] != block)
+                fill(block, slot, program);
+            return entries[slot][address % INSTR_CACHE_BLOCK];
+        }
+
+        ARDENS_IRAM void fill(uint16_t block, size_t slot, const avr_instr_t* program);
+    };
+    instruction_cache_t<MERGED_CACHE_SLOTS> merged_cache;
+    instruction_cache_t<DECODED_CACHE_SLOTS> decoded_cache;
+
     ARDENS_FORCEINLINE const avr_instr_t& merged_instruction(uint16_t address)
     {
-        const uint16_t block = address / MERGED_CACHE_BLOCK;
-        const size_t slot = block % merged_cache.size();
-        if(merged_cache_tags[slot] != block)
-            fill_merged_cache(block, slot);
-        return merged_cache[slot][address % MERGED_CACHE_BLOCK];
+        return merged_cache.get(address, merged_prog.data());
     }
 #endif
 #else
@@ -652,8 +721,37 @@ struct atmega32u4_t
 #endif
     bool program_loaded;
     bool decoded;
+#ifdef ARDUGO_QUIET_TEST
+    struct {
+        uint32_t batches = 0;
+        uint32_t micros_blocks = 0;
+        uint32_t micros_timer_blocks = 0;
+        uint32_t micros_calls = 0;
+        uint32_t micros_wait_iterations = 0;
+        uint32_t branch_short = 0;
+        uint32_t branch_jit = 0;
+        uint32_t branch_jit_fb = 0;
+        uint32_t branch_waking = 0;
+        uint32_t branch_sleep = 0;
+        uint32_t pq_pops[16]{};
+        uint32_t short_pq[16]{};
+        uint32_t helper_calls[8]{};
+        uint64_t helper_cycles[8]{};
+        uint32_t timed_func_hits[160]{};
+        uint64_t compile_cycles = 0;
+        bool measuring = false;
+        uint64_t queue_cycles = 0;
+        uint64_t instruction_cycles = 0;
+        uint64_t peripheral_cycles = 0;
+    } benchmark;
+#endif
     void decode();
     void merge_instrs();
+#ifdef ARDUGO_EMBEDDED
+    uint32_t execute_merged(int32_t budget, const uint16_t* jit_block_off = nullptr);
+    uint32_t execute_jit(int32_t budget);
+    void jit_invalidate();
+#endif
     size_t addr_to_disassembled_index(uint16_t addr);
 
     static void st_handle_pin(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
@@ -713,6 +811,9 @@ struct atmega32u4_t
     static void timer0_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer0_handle_st_tcnt(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static uint8_t timer0_handle_ld_tcnt(atmega32u4_t& cpu, uint16_t ptr);
+#ifdef ARDUGO_EMBEDDED
+    bool peek_timer0(uint64_t cycle, uint8_t& result) const;
+#endif
     void update_sync_timers();
     void update_timer0();
 
@@ -746,6 +847,9 @@ struct atmega32u4_t
         bool fast_pwm;
         bool top_source_icr;
         bool compare_block_next_tick;
+        uint64_t idle_start_cycle;
+        uint32_t idle_phase;
+        bool idle_deferred;
         template<class A> void serialize(A& a)
         {
             a(next_update_cycle);
@@ -757,16 +861,20 @@ struct atmega32u4_t
             a(phase_correct, count_down);
             a(update_ocrN_at_top, update_ocrN_at_bottom);
             a(fast_pwm, top_source_icr, compare_block_next_tick);
+            a(idle_start_cycle, idle_phase, idle_deferred);
         }
     };
     static void timer1_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer3_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer1_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer3_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
+    static uint8_t timer1_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr);
+    static uint8_t timer3_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr);
     static uint8_t timer1_handle_ld_regs(atmega32u4_t& cpu, uint16_t ptr);
     static uint8_t timer3_handle_ld_regs(atmega32u4_t& cpu, uint16_t ptr);
     void update_timer1();
     void update_timer3();
+    void flush_idle_sync_timers();
 
     timer16_t timer1;
     timer16_t timer3;
@@ -823,6 +931,7 @@ struct atmega32u4_t
     static void timer4_handle_st_ocrN(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer4_handle_st_regs(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void timer4_handle_st_tifr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
+    static uint8_t timer4_handle_ld_tifr(atmega32u4_t& cpu, uint16_t ptr);
     static uint8_t timer4_handle_ld_tcnt(atmega32u4_t& cpu, uint16_t ptr);
     void update_timer4();
     timer10_t timer4;
@@ -853,6 +962,33 @@ struct atmega32u4_t
     uint64_t spi_transmit_zero_cycle; // retained boundary for same-cycle writes
     uint64_t spi_flag_cycle; // delayed SPIF can overlap the next transfer
     uint32_t spi_clock_cycles;
+#ifdef ARDUGO_EMBEDDED
+    arduboy_t* spi_bus = nullptr;
+    arduboy_core_state_t* core_state = nullptr;
+#endif
+    // The timed handlers service pending transfers before using these routines.
+    ARDENS_FORCEINLINE void acknowledge_spi_flags()
+    {
+        using namespace reg::bit::SPSR;
+        if(spsr_read_after_transmit)
+        {
+            spsr_read_after_transmit = false;
+            data[reg::addr::SPSR] &= ~SPIF;
+        }
+        if(spi_wcol_read)
+        {
+            spi_wcol_read = false;
+            data[reg::addr::SPSR] &= ~WCOL;
+        }
+    }
+
+    ARDENS_FORCEINLINE uint8_t read_spi_status()
+    {
+        const uint8_t status = data[reg::addr::SPSR];
+        spsr_read_after_transmit |= (status & reg::bit::SPSR::SPIF) != 0;
+        spi_wcol_read |= (status & reg::bit::SPSR::WCOL) != 0;
+        return status;
+    }
     void update_spi();
     static void spi_handle_st_spcr_or_spsr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static void spi_handle_st_spdr(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
@@ -945,6 +1081,7 @@ struct atmega32u4_t
     static constexpr int16_t SOUND_GAIN = 2000;
     uint64_t sound_prev_cycle;
     uint32_t sound_cycle;
+    int32_t sound_acc;
     uint32_t sound_enabled; // bitmask of pins 1 and 2
     bool sound_pwm;
     int16_t sound_pwm_val;
@@ -1072,7 +1209,12 @@ struct atmega32u4_t
             a(frame_number, selected_endpoint, uerst);
         }
     };
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    std::unique_ptr<usb_state_t> usb_storage = std::make_unique<usb_state_t>();
+    usb_state_t& usb = *usb_storage;
+#else
     usb_state_t usb;
+#endif
     static void usb_st_handler(atmega32u4_t& cpu, uint16_t ptr, uint8_t x);
     static uint8_t usb_ld_handler(atmega32u4_t& cpu, uint16_t ptr);
     void update_usb();
@@ -1115,7 +1257,19 @@ struct atmega32u4_t
     void check_all_interrupts();
     bool check_interrupt(uint8_t vector, uint8_t flag, uint8_t& tifr);
 
-    uint64_t cycle_count;
+    ARDENS_FORCEINLINE bool has_pending_interrupt() const
+    {
+        return ((data[reg::addr::UDINT] & data[reg::addr::UDIEN]) |
+                (data[reg::addr::USBINT] & data[reg::addr::USBCON])) ||
+               data[reg::addr::UEINT] ||
+               (data[reg::addr::WDTCSR] & reg::bit::WDTCSR::WDIF) ||
+               (data[reg::addr::TIFR1] & data[reg::addr::TIMSK1]) ||
+               (data[reg::addr::TIFR0] & data[reg::addr::TIMSK0]) ||
+               (data[reg::addr::TIFR3] & data[reg::addr::TIMSK3]) ||
+               ((data[reg::addr::TWCR] & (reg::bit::TWCR::TWINT | reg::bit::TWCR::TWIE)) ==
+                (reg::bit::TWCR::TWINT | reg::bit::TWCR::TWIE)) ||
+               (data[reg::addr::TIFR4] & data[reg::addr::TIMSK4]);
+    }
 
     // lock bits
     uint8_t lock;
@@ -1143,8 +1297,7 @@ struct atmega32u4_t
     
     inline uint16_t bootloader_address() const
     {
-        static uint16_t const ADDRS[4] = { 0x3800, 0x3c00, 0x3e00, 0x3f00 };
-        return ADDRS[BOOTSZ() & 3];
+        return uint16_t(0x4000u - (0x800u >> (BOOTSZ() & 3u)));
     }
 
     void reset();
@@ -1152,6 +1305,7 @@ struct atmega32u4_t
 
     // execute at least one cycle (return how many cycles were executed)
     uint32_t advance_cycle();
+    uint64_t service_peripheral_events();
 
     // update delayed peripheral states
     void update_all();
@@ -1172,7 +1326,17 @@ struct display_t
 
     // moving average
     static constexpr int MAX_PIXEL_HISTORY = 4;
+    struct FilterRow
+    {
+        std::array<std::array<uint32_t, 4>, 5> bits;
+        std::array<uint8_t, 5> p0;
+        std::array<uint8_t, 5> p1;
+    };
     std::array<std::array<uint8_t, 8192>, MAX_PIXEL_HISTORY> pixels;
+    std::array<FilterRow, 64> filter_rows;
+    uint64_t filtered_steady_mask;
+    uint8_t filter_slot;
+    bool filter_dirty;
     int pixel_history_index;
     bool enable_filter;
 
@@ -1240,6 +1404,7 @@ struct display_t
 
     void update_pixels_row();
     void filter_pixels();
+    void reset_filter_state(bool seed_from_pixels0 = false);
 
     uint64_t ps_rem;
 
@@ -1254,6 +1419,16 @@ struct display_t
     // whether a vsync has just occurred
     bool vsync;
 
+#ifdef ARDUGO_EMBEDDED
+    uint8_t const* external_ram = nullptr;
+    ARDENS_FORCEINLINE uint8_t const* ram_ptr() const
+    {
+        return external_ram ? external_ram : ram.data();
+    }
+#else
+    ARDENS_FORCEINLINE uint8_t const* ram_ptr() const { return ram.data(); }
+#endif
+
     void send_data(uint8_t byte);
     void send_command(uint8_t byte);
 
@@ -1261,6 +1436,111 @@ struct display_t
     // returns true if vsync occurred
     bool advance(uint64_t ps);
 };
+
+template <typename DisplayT>
+ARDENS_FORCEINLINE void display_send_data_common(DisplayT& d, uint8_t byte)
+{
+    if(d.type != display_t::SH1106 || uint8_t(d.data_col - 2) < 128)
+    {
+        uint8_t col = d.data_col;
+        if(d.type == display_t::SH1106)
+            col -= 2;
+        uint8_t mapped_col = d.segment_remap ? 127 - col : col;
+        size_t i = d.data_page * 128 + mapped_col;
+        d.ram[i & 1023] = byte;
+    }
+
+    switch(d.addressing_mode)
+    {
+    case display_t::addr_mode::HORIZONTAL:
+        if(d.data_col >= d.col_end)
+        {
+            d.data_col = d.col_start;
+            if(d.data_page >= d.page_end)
+                d.data_page = d.page_start;
+            else
+                d.data_page = (d.data_page + 1) & 0x7;
+        }
+        else
+            d.data_col = (d.data_col + 1) & 0x7f;
+        break;
+
+    case display_t::addr_mode::VERTICAL:
+        if(d.data_page >= d.page_end)
+        {
+            d.data_page = d.page_start;
+            if(d.data_col >= d.col_end)
+                d.data_col = d.col_start;
+            else
+                d.data_col = (d.data_col + 1) & 0x7f;
+        }
+        else
+            d.data_page = (d.data_page + 1) & 0x7;
+        break;
+
+    case display_t::addr_mode::PAGE:
+        if(d.data_col >= d.col_end)
+            d.data_col = d.col_start;
+        else
+            d.data_col = (d.data_col + 1) & 0x7f;
+        break;
+
+    default:
+        break;
+    }
+}
+
+#ifdef ARDUGO_EMBEDDED
+struct core_display_t
+{
+    std::array<uint8_t, 1024> ram{};
+    display_t::type_t type = display_t::SSD1306;
+    display_t::addr_mode addressing_mode = display_t::addr_mode::PAGE;
+    uint8_t col_start = 0;
+    uint8_t col_end = 127;
+    uint8_t page_start = 0;
+    uint8_t page_end = 7;
+    uint8_t data_page = 0;
+    uint8_t data_col = 0;
+    bool segment_remap = false;
+
+    void sync_from(display_t const& d, bool copy_ram)
+    {
+        type = d.type;
+        addressing_mode = d.addressing_mode;
+        col_start = d.col_start;
+        col_end = d.col_end;
+        page_start = d.page_start;
+        page_end = d.page_end;
+        data_page = d.data_page;
+        data_col = d.data_col;
+        segment_remap = d.segment_remap;
+        if(copy_ram)
+            ram = d.ram;
+    }
+
+    void sync_cursors_to(display_t& d) const
+    {
+        d.data_page = data_page;
+        d.data_col = data_col;
+    }
+
+    void sync_to(display_t& d, bool copy_ram) const
+    {
+        d.type = type;
+        d.addressing_mode = addressing_mode;
+        d.col_start = col_start;
+        d.col_end = col_end;
+        d.page_start = page_start;
+        d.page_end = page_end;
+        d.data_page = data_page;
+        d.data_col = data_col;
+        d.segment_remap = segment_remap;
+        if(copy_ram)
+            d.ram = ram;
+    }
+};
+#endif
 
 struct w25q128_t
 {
@@ -1326,8 +1606,23 @@ struct w25q128_t
 #ifdef ARDUGO_EMBEDDED
     size_t save_start = DATA_BYTES; // Writes may only touch the supplied FX save region.
 #endif
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    // The sector payloads and pointer tables can remain in PSRAM. The SPI
+    // command decoder and byte cursor are accessed on every transfer.
+    std::vector<std::unique_ptr<sector_t>> sectors =
+        std::vector<std::unique_ptr<sector_t>>(NUM_SECTORS);
+    std::vector<std::unique_ptr<sector_t>> sectors_modified_data =
+        std::vector<std::unique_ptr<sector_t>>(NUM_SECTORS);
+    std::array<const sector_t*, 4> read_sectors{};
+    std::array<size_t, 4> read_sector_indices{
+        NUM_SECTORS, NUM_SECTORS, NUM_SECTORS, NUM_SECTORS
+    };
+    static void* operator new(size_t size);
+    static void operator delete(void* ptr);
+#else
     std::array<std::unique_ptr<sector_t>, NUM_SECTORS> sectors;
     std::array<std::unique_ptr<sector_t>, NUM_SECTORS> sectors_modified_data;
+#endif
 
     std::bitset<NUM_SECTORS> sectors_modified;
     bool sectors_dirty;
@@ -1366,12 +1661,14 @@ struct w25q128_t
     uint32_t max_page;
 
     bool busy_error;
+    uint32_t data_gen = 1;
 
     void reset();
     void erase_all_data();
     void set_empty_page_range();
     bool has_empty_page_range() const;
 
+    void fill_cache64(size_t base, uint8_t* dst);
     uint8_t read_byte(size_t addr);
     void write_byte(size_t addr, uint8_t data);
     void program_byte(size_t addr, uint8_t data);
@@ -1380,7 +1677,43 @@ struct w25q128_t
     void advance(uint64_t ps);
 
     void set_enabled(bool e);
+    ARDENS_FORCEINLINE uint8_t read_byte_fast(size_t addr)
+    {
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+        if(addr < DATA_BYTES) [[likely]]
+        {
+            const size_t sector_index = addr / SECTOR_BYTES;
+            const size_t slot = sector_index & 3u;
+            if(read_sectors[slot] && read_sector_indices[slot] == sector_index) [[likely]]
+                return (*read_sectors[slot])[addr & (SECTOR_BYTES - 1)];
+        }
+#endif
+        return read_byte(addr);
+    }
+
+    ARDENS_FORCEINLINE uint8_t spi_transceive_fast(uint8_t byte)
+    {
+        if(!enabled) return 0;
+        if(reading >= 4) [[likely]]
+        {
+            busy_error = false;
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+            const size_t sector_index = current_addr >> 12;
+            const size_t slot = sector_index & 3u;
+            const uint8_t data_to_send = (read_sectors[slot] && read_sector_indices[slot] == sector_index)
+                ? (*read_sectors[slot])[current_addr & (SECTOR_BYTES - 1)]
+                : read_byte(current_addr);
+#else
+            const uint8_t data_to_send = read_byte_fast(current_addr);
+#endif
+            current_addr = (current_addr + 1) & 0xffffffu;
+            return data_to_send;
+        }
+        return spi_transceive_slow(byte);
+    }
+
     uint8_t spi_transceive(uint8_t byte);
+    uint8_t spi_transceive_slow(uint8_t byte);
     void track_page();
 };
 
@@ -1544,19 +1877,62 @@ struct arduboy_core_state_t
     atmega32u4_t cpu{};
     uint64_t ps_rem{};
 #ifdef ARDUGO_EMBEDDED
-    uint32_t oled_cycles{}; // Deferred rows, flushed before a display write or a save.
+    core_display_t oled{};
+    w25q128_t* fx_ptr = nullptr;
+    uint64_t oled_cycle{};
+    uint64_t oled_next_row{};
+    uint64_t fx_cycle{};
     bool oled_in_reset = true;
     uint8_t fx_port = reg::addr::PORTD;
     uint8_t fx_mask = reg::bit::PORTD::PORTD1;
     bool fx_selected{};
     bool fx_busy{};
+    uint32_t fx_cache_base = UINT32_MAX;
+    uint32_t fx_cache_gen = 0;
+    std::array<uint8_t, 64> fx_cache{};
+
+    ARDENS_FORCEINLINE uint8_t spi_read_fx_cached(w25q128_t& fx)
+    {
+        fx.busy_error = false;
+        const uint32_t addr = fx.current_addr;
+        const uint32_t base = addr & ~63u;
+        if(fx_cache_base != base || fx_cache_gen != fx.data_gen) [[unlikely]]
+        {
+            fx.fill_cache64(base, fx_cache.data());
+            fx_cache_base = base;
+            fx_cache_gen = fx.data_gen;
+        }
+        fx.current_addr = (addr + 1u) & 0xffffffu;
+        return fx_cache[addr & 63u];
+    }
 #endif
 };
+
+#ifdef ARDUGO_EMBEDDED
+ARDENS_FORCEINLINE uint8_t exchange_fx_spi_fast(arduboy_core_state_t& state, uint8_t byte, uint64_t at)
+{
+    auto& fx = *state.fx_ptr;
+    if(fx.enabled && fx.reading >= 4) [[likely]]
+        return state.spi_read_fx_cached(fx);
+    const uint8_t received = fx.spi_transceive_fast(byte);
+    if(fx.busy_ps_rem != 0) [[unlikely]]
+    {
+        state.fx_busy = true;
+        state.fx_cycle = at;
+    }
+    return received;
+}
+#endif
 
 struct arduboy_peripherals_t
 {
     display_t display{};
+#if defined(ARDUGO_EMBEDDED) && defined(ESP_PLATFORM)
+    std::unique_ptr<w25q128_t> fx_storage = std::make_unique<w25q128_t>();
+    w25q128_t& fx = *fx_storage;
+#else
     w25q128_t fx{};
+#endif
     bool prev_display_reset{};
     uint8_t fxport_reg = reg::addr::PORTD;
     uint8_t fxport_mask = reg::bit::PORTD::PORTD1;
@@ -1704,6 +2080,24 @@ public:
     uint32_t cycle();
 #ifdef ARDUGO_EMBEDDED
     void flush_display();
+    ARDENS_IRAM void advance_display_to(uint64_t at);
+    void schedule_display_row();
+    ARDENS_IRAM void sync_spi_pins(uint64_t at);
+    ARDENS_IRAM uint8_t exchange_spi_byte(uint8_t byte, uint64_t at);
+    ARDENS_FORCEINLINE uint8_t exchange_spi_byte_fast(uint8_t byte, uint64_t at)
+    {
+        auto& state = core_state;
+        const uint8_t port = state.cpu.data[reg::addr::PORTD];
+        if(state.fx_selected && (port & reg::bit::PORTD::PORTD6) && !state.fx_busy) [[likely]]
+            return exchange_fx_spi_fast(state, byte, at);
+        if(!(port & reg::bit::PORTD::PORTD6) && (port & reg::bit::PORTD::PORTD4) &&
+           !state.fx_selected && (state.oled_in_reset || at < state.oled_next_row))
+        {
+            display_send_data_common(state.oled, byte);
+            return 0;
+        }
+        return exchange_spi_byte(byte, at);
+    }
 #endif
 
     void advance_instr();

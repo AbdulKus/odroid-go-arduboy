@@ -45,7 +45,7 @@ ARDENS_FORCEINLINE void atmega32u4_t::pll_schedule()
     }
 }
 
-ARDENS_FORCEINLINE void atmega32u4_t::update_pll()
+ARDENS_NOINLINE void atmega32u4_t::update_pll()
 {
     if(!pll_busy)
         return;
